@@ -118,6 +118,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=str, default=None, help="Output path (mp4). Default: model-specific.")
     parser.add_argument("--fps", type=int, default=None, help="Frames per second for the output video.")
     parser.add_argument(
+        "--warmup",
+        type=int,
+        default=0,
+        help="Number of untimed warm-up generations to run before the timed generation. "
+        "Triggers torch.compile so the reported generation time excludes compile/recompile overhead.",
+    )
+    parser.add_argument(
         "--vae-use-slicing",
         action="store_true",
         help="Enable VAE slicing for memory optimization.",
@@ -234,6 +241,15 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of HSDP replica groups.",
     )
+    parser.add_argument(
+        "--no-guardrails",
+        dest="no_guardrails",
+        action="store_true",
+        help=(
+            "Disable Cosmos3 text/video safety guardrails (currently only applicable for Cosmos3). "
+            "You are responsible for license compliance; see the NVIDIA Open Model License Agreement."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -321,6 +337,8 @@ def main():
         omni_kwargs["cache_backend"] = args.cache_backend
         omni_kwargs["cache_config"] = cache_config
         omni_kwargs["enable_cache_dit_summary"] = args.enable_cache_dit_summary
+    if args.no_guardrails:
+        omni_kwargs["model_config"] = {"guardrails": False}
 
     omni = Omni(**omni_kwargs)
 
@@ -357,6 +375,20 @@ def main():
     )
     if args.guidance_scale_high is not None:
         sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high
+
+    for i in range(args.warmup):
+        print(f"[Warmup] Running warm-up generation {i + 1}/{args.warmup} (untimed)...")
+        warmup_start = time.perf_counter()
+        omni.generate(
+            prompt_dict,
+            OmniDiffusionSamplingParams(**sampling_kwargs),
+        )
+        print(f"[Warmup] Warm-up generation {i + 1} took {time.perf_counter() - warmup_start:.4f} seconds.")
+
+    if args.warmup:
+        # Warm-up runs consume the generator's RNG state; re-seed so the timed
+        # output stays deterministic with respect to --seed.
+        generator.manual_seed(args.seed)
 
     generation_start = time.perf_counter()
     frames = omni.generate(

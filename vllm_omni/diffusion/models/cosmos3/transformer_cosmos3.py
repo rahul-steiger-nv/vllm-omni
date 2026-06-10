@@ -1519,7 +1519,11 @@ class Cosmos3VFMTransformer(nn.Module):
                 if isinstance(hidden_gen, tuple):
                     hidden_gen = hidden_gen[0]
 
-            hidden_gen = self.gen_sp_gather(hidden_gen)
+        # Gather the sequence-parallel shards back to the full sequence before
+        # norm/proj_out/unpatchify. Runs for both branches (no-op nn.Identity
+        # when SP is inactive). Previously only the cache-dit branch gathered,
+        # which left the standard path sharded and broke unpatchify under Ulysses.
+        hidden_gen = self.gen_sp_gather(hidden_gen)
 
         # Final norm and project back to latent space
         hidden_gen = self.norm_moe_gen(hidden_gen)
