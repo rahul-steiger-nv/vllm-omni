@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import nullcontext
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from diffusers.models.autoencoders import AutoencoderKLWan
 from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
 from diffusers.models.autoencoders.vae import DecoderOutput
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.distributed.autoencoders import wan_sp_parallel
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
     DistributedOperator,
     DistributedVaeMixin,
@@ -268,9 +271,60 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
         dec = torch.clamp(dec, min=-1.0, max=1.0)
         return dec
 
+    def _sp_decode_split_dim(self) -> str | None:
+        mode = os.environ.get("VLLM_OMNI_WAN_VAE_PARALLEL_MODE", "").strip().lower()
+        split_dim = os.environ.get("VLLM_OMNI_WAN_VAE_SPLIT_DIM", "").strip().lower()
+        if mode in ("sp_width", "width", "width_shard"):
+            return "width"
+        if mode in ("sp_height", "height", "height_shard", "spatial", "spatial_shard"):
+            if split_dim in ("height", "width"):
+                return split_dim
+            return "height"
+        return None
+
+    def _sp_decode_enabled(self, z: torch.Tensor) -> bool:
+        split_dim = self._sp_decode_split_dim()
+        if split_dim is None:
+            return False
+        if z.ndim != 5:
+            logger.warning("Wan VAE spatial sharded decode expects 5D latent input; falling back to tiled decode.")
+            return False
+        if not self.is_distributed_enabled():
+            return False
+
+        group = self.distributed_executor.group
+        world_size = dist.get_world_size(group=group)
+        requested_size = int(self.distributed_executor.parallel_size)
+        pp_size = min(requested_size, int(world_size))
+        if pp_size != world_size:
+            logger.warning(
+                "Wan VAE spatial sharded decode currently requires vae_patch_parallel_size "
+                "to match the DIT group size; falling back to tiled decode. "
+                "requested=%s dit_group=%s split_dim=%s",
+                requested_size,
+                world_size,
+                split_dim,
+            )
+            return False
+        return True
+
+    def _sp_height_decode_enabled(self, z: torch.Tensor) -> bool:
+        return self._sp_decode_split_dim() == "height" and self._sp_decode_enabled(z)
+
     def tiled_decode(self, z: torch.Tensor, return_dict: bool = True):
         if not self.is_distributed_enabled():
             return super().tiled_decode(z, return_dict=return_dict)
+
+        split_dim = self._sp_decode_split_dim()
+        if split_dim is not None and self._sp_decode_enabled(z):
+            logger.debug("Decode running with Wan VAE sp_%s mode", split_dim)
+            return wan_sp_parallel.sp_parallel_decode(
+                self,
+                z,
+                group=self.distributed_executor.group,
+                return_dict=return_dict,
+                split_dim=split_dim,
+            )
 
         logger.debug("Decode running with distributed executor")
         result = self.distributed_executor.execute(
