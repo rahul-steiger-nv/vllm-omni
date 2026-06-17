@@ -88,7 +88,7 @@ def test_validate_supported_config_rejects_unsupported_flags(key: str, value) ->
 
 
 def test_transformer_sharding_offload_and_patch_round_trip_contracts() -> None:
-    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3LanguageModel, Cosmos3VFMTransformer
 
     model = object.__new__(Cosmos3VFMTransformer)
     nn.Module.__init__(model)
@@ -104,6 +104,7 @@ def test_transformer_sharding_offload_and_patch_round_trip_contracts() -> None:
     ]
     assert matched == ["language_model.layers.0", "language_model.layers.1", "gen_layers.0"]
     assert Cosmos3VFMTransformer._layerwise_offload_blocks_attrs == ["gen_layers"]
+    assert Cosmos3LanguageModel._layerwise_offload_blocks_attrs == ["layers"]
     assert Cosmos3VFMTransformer._repeated_blocks == ["Cosmos3GenDecoderLayer"]
 
     model.latent_patch_size = 2

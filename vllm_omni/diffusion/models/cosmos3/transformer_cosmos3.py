@@ -856,6 +856,8 @@ class Cosmos3LanguageModel(nn.Module):
     computed once and reused across all sampling steps.
     """
 
+    _layerwise_offload_blocks_attrs = ["layers"]
+
     def __init__(
         self,
         *,
@@ -945,7 +947,9 @@ class Cosmos3VFMTransformer(nn.Module):
     The UND pathway runs once per generation (K/V cached). The GEN pathway
     runs at each denoising step.
 
-    Layerwise offloading uses ``gen_layers`` as the block container.
+    Layerwise offloading uses ``gen_layers`` as the GEN block container.  The
+    nested UND language model declares its own ``layers`` container so the two
+    pathways are offloaded as independent rings.
 
     Sequence parallelism uses ``_sp_plan`` to shard/gather the GEN pathway at
     module boundaries. ``Cosmos3CrossAttention`` checks

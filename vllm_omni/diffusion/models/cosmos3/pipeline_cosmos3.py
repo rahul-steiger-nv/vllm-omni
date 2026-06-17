@@ -40,7 +40,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -343,7 +343,12 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
 # Pipeline
 # ---------------------------------------------------------------------------
 class Cosmos3OmniDiffusersPipeline(
-    nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarMixin, DiffusionPipelineProfilerMixin
+    nn.Module,
+    CFGParallelMixin,
+    SupportImageInput,
+    SupportsComponentDiscovery,
+    ProgressBarMixin,
+    DiffusionPipelineProfilerMixin,
 ):
     """Cosmos3 text/image-to-video / text-to-image pipeline.
 
@@ -370,6 +375,10 @@ class Cosmos3OmniDiffusersPipeline(
 
     support_image_input: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
+    _dit_modules: ClassVar[list[str]] = ["transformer.language_model", "transformer"]
+    _encoder_modules: ClassVar[list[str]] = []
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+    _resident_modules: ClassVar[list[str]] = []
 
     def __init__(
         self,
