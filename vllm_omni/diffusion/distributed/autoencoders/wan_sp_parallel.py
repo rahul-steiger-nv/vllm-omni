@@ -1,5 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# The halo-exchange spatial-parallel decode here is adapted from SGLang's
+# spatial-parallel VAE decode
+#   https://github.com/sgl-project/sglang
+#   (python/sglang/multimodal_gen/runtime/layers/parallel_conv.py)
+# which is in turn adapted from FastVideo (https://github.com/hao-ai-lab/FastVideo).
+# This version generalizes the height-only sharding to shard along height or
+# width and adds the Wan causal-conv ``feat_cache`` handling.
 """Spatially-sharded Wan VAE decode.
 
 The existing distributed Wan VAE path shards *tiles*.  This module adds an
