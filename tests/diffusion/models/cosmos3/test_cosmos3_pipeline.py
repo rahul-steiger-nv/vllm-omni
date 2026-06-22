@@ -23,6 +23,7 @@ def test_pipeline_declares_layerwise_offload_components() -> None:
     assert Cosmos3OmniDiffusersPipeline._encoder_modules == []
     assert Cosmos3OmniDiffusersPipeline._vae_modules == ["vae"]
     assert Cosmos3OmniDiffusersPipeline._resident_modules == []
+    assert hasattr(Cosmos3OmniDiffusersPipeline, "enable_omni_model_cpu_offload")
 
 
 class StubScheduler:
