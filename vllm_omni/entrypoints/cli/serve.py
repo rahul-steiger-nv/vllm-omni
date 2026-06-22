@@ -645,6 +645,17 @@ class OmniServeCommand(CLISubcommand):
             "Distributes VAE decode workload across multiple ranks by splitting the latent spatially. "
             "Equivalent to setting DiffusionParallelConfig.vae_patch_parallel_size.",
         )
+        omni_config_group.add_argument(
+            "--vae-parallel-mode",
+            type=str,
+            default="tile",
+            choices=["tile", "sp_height", "sp_width"],
+            help="VAE parallel decode strategy for diffusion models. "
+            "'tile' (default) uses patch/tile parallel decode; 'sp_height'/'sp_width' use "
+            "spatially-sharded decode that splits decoder feature maps along height/width and "
+            "exchanges halo regions. The 'sp_*' modes require vae_patch_parallel_size to match "
+            "the DiT group size. Equivalent to setting DiffusionParallelConfig.vae_parallel_mode.",
+        )
 
         # Default sampling parameters
         omni_config_group.add_argument(

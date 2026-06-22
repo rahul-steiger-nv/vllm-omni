@@ -448,6 +448,42 @@ Complete examples in the codebase:
 
 ---
 
+## Spatially-Sharded Decode (Wan)
+
+The tile-parallel executor above assigns independent spatial **tiles** to ranks. The Wan VAE additionally supports a **spatially-sharded (SP) decode** backend, selected through `DiffusionParallelConfig.vae_parallel_mode` (`"sp_height"` or `"sp_width"`; default is `"tile"`).
+
+### How it differs from tile parallel
+
+| Aspect | Tile parallel (`"tile"`) | Spatially-sharded (`"sp_height"`/`"sp_width"`) |
+|--------|--------------------------|-----------------------------------------------|
+| Unit of work | Independent overlapping tiles | A single global feature map sharded along H or W |
+| Cross-rank communication | Gather tiles to rank 0, stitch + blend | Per-conv **halo exchange** of boundary rows/cols (P2P) |
+| Output assembly | Blend overlapping tiles | All-gather shards, trim padding |
+| Scope | Decode + encode | Decode only |
+
+SP decode swaps the decoder's spatial convolutions/padding for halo-exchanging variants (`WanDistConv2d`, `WanDistCausalConv3d`, `WanDistZeroPad2d`) so each rank only holds a shard of the activations but still sees the correct receptive field at shard boundaries. Implementation lives in `vllm_omni/diffusion/distributed/autoencoders/wan_sp_parallel.py`.
+
+### Wiring
+
+`vae_parallel_mode` flows through the same path as `vae_patch_parallel_size`:
+
+```text
+serve.py (--vae-parallel-mode) / OmniEngineArgs
+  -> DiffusionParallelConfig.vae_parallel_mode
+  -> registry.py: model.vae.set_parallel_size(vae_pp_size, mode=...)
+  -> DistributedVaeExecutor.parallel_mode
+  -> DistributedAutoencoderKLWan.tiled_decode dispatch
+```
+
+`DistributedAutoencoderKLWan._sp_decode_enabled()` gates the path: it requires distributed decode to be enabled, a 5D latent, and `vae_patch_parallel_size == DiT group size`. Otherwise it logs a warning and falls back to tile-parallel decode.
+
+### Notes
+
+- The decoder is patched **in place** the first time SP decode runs and is bound to a single split dimension for the lifetime of the VAE instance.
+- Numerical correctness vs. single-GPU decode is covered by `tests/diffusion/distributed/test_wan_sp_parallel.py::test_sp_decode_matches_reference` (multi-GPU, nightly `full_model` + `distributed_cuda`).
+
+---
+
 ## Summary
 
 Adding VAE Patch Parallel support to diffusion model:

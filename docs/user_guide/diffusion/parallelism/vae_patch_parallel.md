@@ -113,6 +113,7 @@ In `DiffusionParallelConfig`:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `vae_patch_parallel_size` | int | 1 | Number of GPUs for VAE patch/tile parallelism. Set to 2 or higher to enable. Should typically match `tensor_parallel_size` as they share the same process group. |
+| `vae_parallel_mode` | str | `"tile"` | VAE parallel decode strategy: `"tile"` (default tile/patch parallel decode), `"sp_height"`, or `"sp_width"` (spatially-sharded decode, Wan only). See [Spatially-Sharded Decode](#spatially-sharded-decode-wan). |
 
 Additional requirements:
 
@@ -122,6 +123,56 @@ Additional requirements:
 
 !!! note "Automatic VAE Tiling"
     When `vae_patch_parallel_size > 1` and the model has a distributed VAE (`DistributedVaeMixin`), the system automatically sets `vae_use_tiling=True` if not already enabled.
+
+---
+
+## Spatially-Sharded Decode (Wan)
+
+The default `vae_parallel_mode="tile"` distributes whole tiles across ranks. For the **Wan** VAE there is an alternative decode strategy, **spatially-sharded (SP) decode**, selected via `vae_parallel_mode="sp_height"` or `vae_parallel_mode="sp_width"`.
+
+Instead of assigning independent tiles to ranks, SP decode shards the decoder feature maps along the height (`sp_height`) or width (`sp_width`) dimension and exchanges halo rows/columns between neighboring ranks around the spatial convolutions. This keeps the receptive field correct across shard boundaries, so the result matches the single-GPU decode within numerical tolerance.
+
+```python
+from vllm_omni import Omni
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+omni = Omni(
+    model="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    parallel_config=DiffusionParallelConfig(
+        tensor_parallel_size=2,
+        vae_patch_parallel_size=2,       # must match the DiT group size for SP decode
+        vae_parallel_mode="sp_width",    # or "sp_height"
+    ),
+    vae_use_tiling=True,
+)
+```
+
+Or from the CLI / serving entrypoint:
+
+```bash
+vllm serve Wan-AI/Wan2.1-T2V-1.3B-Diffusers --omni \
+    --tensor-parallel-size 2 \
+    --vae-patch-parallel-size 2 \
+    --vae-parallel-mode sp_width \
+    --vae-use-tiling
+```
+
+**Constraints and behavior:**
+
+- SP decode is **decode-only** and currently implemented for the **Wan** VAE. Other models ignore `sp_*` modes.
+- It requires `vae_patch_parallel_size` to **match the DiT process group size**. If it does not, the VAE logs a warning and **falls back to tile-parallel decode** at runtime.
+- `sp_height` and `sp_width` are mutually exclusive for a given VAE instance (the decoder is patched in place for a single split dimension).
+
+To benchmark SP decode against the non-parallel and tiled decode (all ranks must see every GPU, so
+`CUDA_VISIBLE_DEVICES` should expose all of them and match `--nproc-per-node` / `--vae-parallel-size`):
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc-per-node 4 \
+    benchmarks/diffusion/benchmark_wan_vae_sp_decode.py \
+    --model Wan-AI/Wan2.1-T2V-1.3B-Diffusers --subfolder vae \
+    --vae-parallel-size 4 --sample-height 720 --sample-width 1280 \
+    --latent-frames 21 --dtype bfloat16 --modes tiled sp_width
+```
 
 ---
 
