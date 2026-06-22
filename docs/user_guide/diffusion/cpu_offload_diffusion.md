@@ -82,6 +82,62 @@ mutual exclusion: when one group runs, the other moves to CPU.
 - Support single GPU only for now
 
 
+### Fast Packed Offloading (Flat Storage)
+
+By default, model-level offloading moves each parameter/buffer individually with
+`.to(device)` / `.to("cpu")`. An opt-in alternative packs all of a group's
+immutable weights into a single byte-aligned, pinned CPU buffer (the CPU copy is
+the source of truth) and stages them into one reusable GPU "arena" per swap. This
+mirrors the TensorRT-LLM visual-gen offload design and trades extra one-time
+setup for:
+
+- One large bandwidth-friendly host-to-device copy per swap instead of many small
+  ones.
+- No device-to-host copy on the way back (weights are immutable, so the pinned
+  CPU master copy is reused).
+- A persistent pinned CPU store and less allocator churn.
+
+Exactly one group is GPU-resident at a time; inactive groups are always rebound
+to their CPU storage (never left as stale pointers into the reused arena). It is
+**disabled by default** so it can be A/B compared against the default backend.
+
+**Python API:**
+```python
+from vllm_omni import Omni
+
+m = Omni(
+    model="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    enable_cpu_offload=True,
+    offload_use_flat_storage=True,
+)
+```
+
+**CLI:**
+```bash
+vllm-omni serve diffusion Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+    --enable-cpu-offload --offload-use-flat-storage
+```
+
+The same packed mechanism powers Cosmos3's nested reasoner/generator pathway
+swap, which has no separate text encoder and therefore always uses flat storage
+when CPU offload is enabled.
+
+#### Limitations
+- HSDP/DTensor (sharded) weights are not supported; flat packing requires
+  contiguous local storage and raises `NotImplementedError` under HSDP.
+- Single GPU only for now.
+- Setup overhead: when offload is enabled, weights are already loaded onto CPU
+  (the model runner uses `load_device="cpu"`), so neither backend stages the full
+  model on GPU at load time. Flat storage then runs a one-time packing pass that
+  copies each group's CPU weights into a separate pinned CPU buffer. This adds
+  setup time and a transient CPU memory overhead of roughly one group (the
+  original tensors plus the packed copy) before the originals are released; the
+  packed pinned copy of all offloaded weights is then retained. It does not
+  reduce the GPU load-time footprint beyond the default backend (a future
+  enhancement could load weights straight into the packed buffer to avoid the
+  extra copy).
+
+
 ## Layerwise (Blockwise) Offloading
 
 ### How It Works
@@ -178,11 +234,15 @@ Both strategies use vLLM-Omni's hook registry system (`HookRegistry` and `ModelH
 
 ```
 OffloadBackend (base class)
-├── ModelLevelOffloadBackend → uses SequentialOffloadHook
+├── ModelLevelOffloadBackend → uses SequentialOffloadHook (.to() swap, default)
+├── FlatModelLevelOffloadBackend → uses FlatGroupOffloadHook + FlatGroupOffloadManager
+│                                   (packed pinned CPU + reusable GPU arena; opt-in)
 └── LayerWiseOffloadBackend → uses LayerwiseOffloadHook
 ```
 
-Factory function `get_offload_backend()` selects the appropriate backend based on configuration.
+Factory function `get_offload_backend()` selects the appropriate backend based on
+configuration. For model-level offload it returns `FlatModelLevelOffloadBackend`
+when `offload_use_flat_storage` is set, otherwise `ModelLevelOffloadBackend`.
 
 
 ## Supported Models

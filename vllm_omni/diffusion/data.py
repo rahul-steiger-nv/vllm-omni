@@ -562,6 +562,9 @@ class OmniDiffusionConfig:
     enable_cpu_offload: bool = False
     # Layer-wise offloading (block-level offloading) parameters
     enable_layerwise_offload: bool = False
+    # Use the byte-packed pinned-CPU + reusable GPU arena backend for model-level
+    # offload instead of the default per-tensor .to() swap. Opt-in for comparison.
+    offload_use_flat_storage: bool = False
 
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 

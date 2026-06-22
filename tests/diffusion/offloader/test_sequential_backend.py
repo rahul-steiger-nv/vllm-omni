@@ -7,6 +7,8 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
+from vllm_omni.diffusion.offloader.sequential_backend import ModelLevelOffloadBackend
 from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
 from vllm_omni.platforms import current_omni_platform
 
@@ -39,6 +41,69 @@ def _track_pin_memory_calls():
         return original(self)
 
     return tracker, mock
+
+
+def test_get_offload_backend_selects_flat_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.offloader import (
+        FlatModelLevelOffloadBackend,
+        get_offload_backend,
+    )
+
+    # Bypass the platform capability guard so backend selection is exercised on CPU.
+    monkeypatch.setattr(current_omni_platform, "supports_cpu_offload", lambda: True, raising=False)
+    monkeypatch.setattr(current_omni_platform, "get_device_count", lambda: 1, raising=False)
+
+    common = dict(
+        enable_cpu_offload=True,
+        enable_layerwise_offload=False,
+        pin_cpu_memory=False,
+        parallel_config=None,
+    )
+    flat_cfg = SimpleNamespace(offload_use_flat_storage=True, **common)
+    seq_cfg = SimpleNamespace(offload_use_flat_storage=False, **common)
+
+    flat_backend = get_offload_backend(flat_cfg, device=torch.device("cpu"))
+    seq_backend = get_offload_backend(seq_cfg, device=torch.device("cpu"))
+
+    assert isinstance(flat_backend, FlatModelLevelOffloadBackend)
+    assert isinstance(seq_backend, ModelLevelOffloadBackend)
+    assert not isinstance(seq_backend, FlatModelLevelOffloadBackend)
+
+
+def test_model_level_backend_delegates_to_custom_pipeline_offload() -> None:
+    class CustomPipeline(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.enable_args = None
+            self.disable_called = False
+
+        def enable_omni_model_cpu_offload(self, **kwargs) -> None:
+            self.enable_args = kwargs
+
+        def disable_omni_model_cpu_offload(self) -> None:
+            self.disable_called = True
+
+    pipeline = CustomPipeline()
+    backend = ModelLevelOffloadBackend(
+        OffloadConfig(strategy=OffloadStrategy.MODEL_LEVEL, pin_cpu_memory=False),
+        torch.device("cpu"),
+    )
+
+    backend.enable(pipeline)
+
+    assert backend.enabled is True
+    assert pipeline.enable_args == {
+        "device": torch.device("cpu"),
+        "pin_memory": False,
+        "use_hsdp": False,
+    }
+
+    backend.disable()
+
+    assert backend.enabled is False
+    assert pipeline.disable_called is True
 
 
 class TestMoveParamsPinMemory:

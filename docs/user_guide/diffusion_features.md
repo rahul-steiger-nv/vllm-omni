@@ -101,7 +101,7 @@ The following tables show which models support each feature:
 
 > Notes:
 
-> 1. CPU Offload has two methods: Module-wise (default for models with DiT + text encoder) and Layerwise. The tables below show **Layerwise support** only.
+> 1. CPU Offload has two methods: Module-wise (default for models with DiT + text encoder) and Layerwise. The tables below show **Layerwise support** only. Module-wise offload additionally supports an opt-in `--offload-use-flat-storage` flag that packs weights into pinned CPU storage and a reusable GPU arena for faster, larger transfers (disabled by default; see the [CPU Offload Guide](diffusion/cpu_offload_diffusion.md)).
 > 2. The **💾Quantization** column is collapsed for readability. See [Quantization Overview](quantization/overview.md) for per-method and per-model support details.
 
 ### ImageGen
@@ -139,7 +139,7 @@ The following tables show which models support each feature:
 > Notes:
 > 1. Nextstep_1(T2I) does not support cache acceleration methods such as TeaCache or Cache-DiT.
 > 2. `Tongyi-MAI/Z-Image-Turbo` and `SII-GAIR/daVinci-MagiHuman-Base-1080p` are distilled models with minimal NFEs; CFG-Parallel is not necessary.
-> 3. Cosmos3 T2I uses `Cosmos3OmniDiffusersPipeline` with `modalities=["image"]`. Model-level CPU offload is not supported; use layerwise offload.
+> 3. Cosmos3 T2I uses `Cosmos3OmniDiffusersPipeline` with `modalities=["image"]`. Model-level CPU offload swaps the nested UND reasoner and GEN generator pathways; layerwise offload remains available for blockwise GEN/UND offload.
 
 ### VideoGen
 

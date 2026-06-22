@@ -25,6 +25,9 @@ class OffloadConfig:
     strategy: OffloadStrategy
     pin_cpu_memory: bool = True
     use_hsdp: bool = False
+    # Use the byte-packed pinned-CPU + reusable GPU arena backend for model-level
+    # offload instead of the default per-tensor .to() swap.
+    use_flat_storage: bool = False
 
     @classmethod
     def from_od_config(cls, od_config: OmniDiffusionConfig) -> "OffloadConfig":
@@ -42,6 +45,7 @@ class OffloadConfig:
         enable_cpu_offload = getattr(od_config, "enable_cpu_offload", False)
         enable_layerwise_offload = getattr(od_config, "enable_layerwise_offload", False)
         pin_cpu_memory = getattr(od_config, "pin_cpu_memory", True)
+        use_flat_storage = getattr(od_config, "offload_use_flat_storage", False)
 
         parallel_config = getattr(od_config, "parallel_config", None)
         use_hsdp = getattr(parallel_config, "use_hsdp", False) if parallel_config else False
@@ -63,6 +67,7 @@ class OffloadConfig:
             strategy=strategy,
             pin_cpu_memory=pin_cpu_memory,
             use_hsdp=use_hsdp,
+            use_flat_storage=use_flat_storage,
         )
 
 

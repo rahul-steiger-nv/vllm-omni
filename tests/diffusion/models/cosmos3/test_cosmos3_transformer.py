@@ -88,7 +88,7 @@ def test_validate_supported_config_rejects_unsupported_flags(key: str, value) ->
 
 
 def test_transformer_sharding_offload_and_patch_round_trip_contracts() -> None:
-    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3LanguageModel, Cosmos3VFMTransformer
 
     model = object.__new__(Cosmos3VFMTransformer)
     nn.Module.__init__(model)
@@ -104,6 +104,7 @@ def test_transformer_sharding_offload_and_patch_round_trip_contracts() -> None:
     ]
     assert matched == ["language_model.layers.0", "language_model.layers.1", "gen_layers.0"]
     assert Cosmos3VFMTransformer._layerwise_offload_blocks_attrs == ["gen_layers"]
+    assert Cosmos3LanguageModel._layerwise_offload_blocks_attrs == ["layers"]
     assert Cosmos3VFMTransformer._repeated_blocks == ["Cosmos3GenDecoderLayer"]
 
     model.latent_patch_size = 2
@@ -129,6 +130,85 @@ def test_forward_returns_video_prediction(monkeypatch: pytest.MonkeyPatch) -> No
     )
 
     assert tuple(output.shape) == (1, 2, 1, 2, 2)
+
+
+def test_model_cpu_offload_swaps_back_to_generator(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+
+    class ToyReasonerLayer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1))
+
+        def forward(self, hidden: torch.Tensor, freqs):
+            del freqs
+            kv = hidden.new_zeros(hidden.shape[0], hidden.shape[1], 1, 1)
+            return hidden + self.weight.to(hidden.dtype), kv, kv
+
+    class ToyGeneratorLayer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1))
+
+        def forward(self, hidden: torch.Tensor, **kwargs):
+            del kwargs
+            return hidden + self.weight.to(hidden.dtype)
+
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
+    )
+    model.language_model.layers = nn.ModuleList([ToyReasonerLayer()])
+    model.gen_layers = nn.ModuleList([ToyGeneratorLayer()])
+    model.enable_model_cpu_offload(device=torch.device("cpu"), pin_memory=False)
+
+    manager = model._offload_manager
+    assert manager is not None
+    assert set(manager.groups) == {"reasoner", "generator"}
+    assert manager.groups["reasoner"].cpu_weights.numel() > 0
+    assert manager.groups["generator"].cpu_weights.numel() > 0
+    assert [entry.name for entry in manager.groups["reasoner"].entries] == ["module_0.0.weight"]
+    assert [entry.name for entry in manager.groups["generator"].entries] == ["module_0.0.weight"]
+    assert manager.arena is not None
+
+    output = model(
+        hidden_states=torch.zeros(1, 2, 1, 2, 2),
+        timestep=torch.tensor([1.0]),
+        text_ids=torch.tensor([[1, 2]], dtype=torch.long),
+        text_mask=torch.ones(1, 2, dtype=torch.long),
+        video_shape=(1, 2, 2),
+        fps=24.0,
+    )
+
+    assert tuple(output.shape) == (1, 2, 1, 2, 2)
+    assert manager.active_group == "generator"
+    assert model.device == torch.device("cpu")
+    assert manager.groups["reasoner"].gpu_weights is None
+    assert manager.groups["generator"].gpu_weights is not None
+    assert manager.arena.weight is not None
+    assert (
+        manager.groups["generator"].gpu_weights.untyped_storage().data_ptr()
+        == manager.arena.weight.untyped_storage().data_ptr()
+    )
+
+    model.disable_model_cpu_offload()
+    assert model._offload_manager is None
+
+
+def test_model_cpu_offload_rejects_hsdp() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    model = Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
+    )
+
+    with pytest.raises(NotImplementedError, match="does not support HSDP"):
+        model.enable_model_cpu_offload(
+            device=torch.device("cpu"),
+            pin_memory=False,
+            use_hsdp=True,
+        )
 
 
 def test_forward_accepts_transfer_control_latents(monkeypatch: pytest.MonkeyPatch) -> None:

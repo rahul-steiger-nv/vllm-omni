@@ -1005,6 +1005,7 @@ class AsyncOmniEngine:
             "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
             "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
             "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
+            "offload_use_flat_storage": kwargs.get("offload_use_flat_storage", False),
             "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
             "boundary_ratio": kwargs.get("boundary_ratio", None),
             "flow_shift": kwargs.get("flow_shift", None),
