@@ -1,4 +1,4 @@
-# VAE Patch Parallelism Guide
+# VAE Parallelism Guide
 
 
 ## Table of Content
@@ -15,7 +15,7 @@
 
 ## Overview
 
-VAE Patch Parallelism distributes the VAE (Variational AutoEncoder) decode/encode computation across multiple GPUs by splitting the latent space into spatial tiles or patches. Each GPU processes a subset of tiles in parallel, significantly reducing peak memory consumption during the VAE decode stage while maintaining output quality.
+VAE parallelism distributes VAE (Variational AutoEncoder) decode/encode work across multiple GPUs. This guide covers VAE patch/tile parallelism, which splits latent space into spatial tiles or patches, and Wan spatial-shard decode, which shards decoder feature maps along height or width.
 
 This is particularly useful for:
 - **High-resolution image generation** where VAE decode can become a memory bottleneck
@@ -25,7 +25,7 @@ This is particularly useful for:
 See supported models list in [Supported Models](../../diffusion_features.md#supported-models).
 
 
-VAE Patch Parallelism uses two strategies based on image size:
+VAE patch parallelism uses two strategies based on image size:
 
 | Strategy | Use Case | How It Works | Overlap Handling | Output Quality |
 |----------|----------|--------------|------------------|----------------|
@@ -143,7 +143,6 @@ omni = Omni(
         vae_patch_parallel_size=2,               # must match the DiT group size
         vae_parallel_mode="spatial_shard_width", # or "spatial_shard_height"
     ),
-    vae_use_tiling=True,
 )
 ```
 
@@ -153,8 +152,7 @@ Or from the CLI / serving entrypoint:
 vllm serve Wan-AI/Wan2.1-T2V-1.3B-Diffusers --omni \
     --tensor-parallel-size 2 \
     --vae-patch-parallel-size 2 \
-    --vae-parallel-mode spatial_shard_width \
-    --vae-use-tiling
+    --vae-parallel-mode spatial_shard_width
 ```
 
 **Constraints and behavior:**
@@ -163,15 +161,12 @@ vllm serve Wan-AI/Wan2.1-T2V-1.3B-Diffusers --omni \
 - It requires `vae_patch_parallel_size` to **match the DiT process group size**. If it does not, the VAE logs a warning and **falls back to tile-parallel decode** at runtime.
 - `spatial_shard_height` and `spatial_shard_width` are mutually exclusive for a given VAE instance (the decoder is patched in place for a single split dimension).
 
-To benchmark spatial-shard decode against the non-parallel and tiled decode (all ranks must see every GPU, so
-`CUDA_VISIBLE_DEVICES` should expose all of them and match `--nproc-per-node` / `--vae-parallel-size`):
+For end-to-end latency/throughput, launch serving with the desired `vae_parallel_mode` and use the existing diffusion serving benchmark:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc-per-node 4 \
-    benchmarks/diffusion/benchmark_wan_vae_spatial_shard_decode.py \
-    --model Wan-AI/Wan2.1-T2V-1.3B-Diffusers --subfolder vae \
-    --vae-parallel-size 4 --sample-height 720 --sample-width 1280 \
-    --latent-frames 21 --dtype bfloat16 --modes tiled spatial_shard_width
+python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+    --endpoint /v1/videos --dataset random --task t2v --num-prompts 1 \
+    --height 480 --width 832 --num-frames 17 --max-concurrency 1
 ```
 
 ---
