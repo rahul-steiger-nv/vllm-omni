@@ -132,11 +132,12 @@ class DiffusionParallelConfig:
 
     - "tile": Patch/tile parallel decode (default). Each rank decodes a subset
       of spatial tiles and the results are stitched on rank 0.
-    - "sp_height": Spatially-sharded decode that splits decoder feature maps
-      along height and exchanges halo rows around spatial convolutions.
-    - "sp_width": Same as "sp_height" but sharded along width.
+    - "spatial_shard_height": Spatially-sharded decode that splits decoder
+      feature maps along height and exchanges halo rows around spatial
+      convolutions.
+    - "spatial_shard_width": Same as "spatial_shard_height" but sharded along width.
 
-    The "sp_*" modes are decode-only and currently require
+    The "spatial_shard_*" modes are decode-only and currently require
     ``vae_patch_parallel_size`` to match the DiT group size; otherwise the VAE
     falls back to tile-parallel decode at runtime.
     """
@@ -172,8 +173,9 @@ class DiffusionParallelConfig:
             f"CFG parallel size must be 1, 2, or 3, but got {self.cfg_parallel_size}"
         )
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
-        assert self.vae_parallel_mode in {"tile", "sp_height", "sp_width"}, (
-            f"vae_parallel_mode must be one of {{'tile', 'sp_height', 'sp_width'}}, but got {self.vae_parallel_mode!r}."
+        assert self.vae_parallel_mode in {"tile", "spatial_shard_height", "spatial_shard_width"}, (
+            "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "
+            f"but got {self.vae_parallel_mode!r}."
         )
         assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, (
             "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"

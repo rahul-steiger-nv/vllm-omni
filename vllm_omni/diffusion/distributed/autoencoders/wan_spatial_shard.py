@@ -86,7 +86,7 @@ def _pad_along_dim(x: torch.Tensor, pad: int, dim: int, value: float = 0.0) -> t
     return torch.cat([x, padding], dim=dim)
 
 
-def _maybe_contiguous_for_sp_gather(x: torch.Tensor) -> torch.Tensor:
+def _maybe_contiguous_for_shard_gather(x: torch.Tensor) -> torch.Tensor:
     if (
         x.dim() == 5
         and hasattr(torch, "channels_last_3d")
@@ -183,7 +183,7 @@ def all_gather_along_dim(
     rank, world_size = _rank_world(group)
     if world_size <= 1:
         return x
-    x = _maybe_contiguous_for_sp_gather(x)
+    x = _maybe_contiguous_for_shard_gather(x)
     gathered = [torch.empty_like(x) for _ in range(world_size)]
     # NCCL has no rank-local gather, so every rank joins the collective; only ``dst``
     # keeps the assembled tensor while the rest drop their copies.
@@ -585,7 +585,7 @@ def _trim_local_conv_output(
 
 
 def _patch_attention_block(module: nn.Module, group: dist.ProcessGroup, split_dim: str) -> None:
-    if getattr(module, "_vllm_omni_sp_attention", False):
+    if getattr(module, "_vllm_omni_spatial_shard_attention", False):
         return
     orig_forward = module.forward
 
@@ -603,7 +603,7 @@ def _patch_attention_block(module: nn.Module, group: dist.ProcessGroup, split_di
         return reshard_from_trimmed_extent(out, local_extent=local_extent, split_dim=split_dim, group=group)
 
     module.forward = MethodType(_forward, module)
-    module._vllm_omni_sp_attention = True  # type: ignore[attr-defined]
+    module._vllm_omni_spatial_shard_attention = True  # type: ignore[attr-defined]
 
 
 def _replace_child(
@@ -697,7 +697,7 @@ def _decoder_upsample_count(decoder: nn.Module) -> int:
     return count
 
 
-def install_wan_sp_parallel_decode(vae: Any, group: dist.ProcessGroup, split_dim: str = "height") -> None:
+def install_wan_spatial_shard_decode(vae: Any, group: dist.ProcessGroup, split_dim: str = "height") -> None:
     """Patch ``vae.decoder`` once for spatially-sharded decode.
 
     This mutates the already-loaded decoder in place by swapping its spatial
@@ -713,17 +713,17 @@ def install_wan_sp_parallel_decode(vae: Any, group: dist.ProcessGroup, split_dim
     take part in the collectives but return an empty placeholder.
     """
     _spatial_dim(split_dim)
-    if getattr(vae, "_vllm_omni_wan_sp_parallel_installed", False):
-        installed_split_dim = getattr(vae, "_vllm_omni_wan_sp_parallel_split_dim", "height")
+    if getattr(vae, "_vllm_omni_wan_spatial_shard_installed", False):
+        installed_split_dim = getattr(vae, "_vllm_omni_wan_spatial_shard_split_dim", "height")
         if installed_split_dim != split_dim:
             raise ValueError(
-                "Wan SP VAE decoder was already patched for "
+                "Wan spatial-shard VAE decoder was already patched for "
                 f"{installed_split_dim!r} split; create a fresh VAE instance to use {split_dim!r} split."
             )
         return
     decoder = getattr(vae, "decoder", None)
     if decoder is None:
-        raise ValueError("Wan SP VAE decode requires a decoder module.")
+        raise ValueError("Wan spatial-shard VAE decode requires a decoder module.")
 
     _patch_decoder_modules(decoder, group, split_dim)
     upsample_count = _decoder_upsample_count(decoder)
@@ -765,12 +765,12 @@ def install_wan_sp_parallel_decode(vae: Any, group: dist.ProcessGroup, split_dim
         )
 
     decoder.forward = MethodType(_forward, decoder)
-    vae._vllm_omni_wan_sp_parallel_installed = True
-    vae._vllm_omni_wan_sp_parallel_split_dim = split_dim
+    vae._vllm_omni_wan_spatial_shard_installed = True
+    vae._vllm_omni_wan_spatial_shard_split_dim = split_dim
     logger.info("Installed Wan VAE %s-sharded decode.", split_dim)
 
 
-def sp_parallel_decode(
+def spatial_shard_decode(
     vae: Any,
     z: torch.Tensor,
     *,
@@ -778,10 +778,10 @@ def sp_parallel_decode(
     return_dict: bool = True,
     split_dim: str = "height",
 ) -> DecoderOutput | tuple[torch.Tensor]:
-    install_wan_sp_parallel_decode(vae, group, split_dim=split_dim)
+    install_wan_spatial_shard_decode(vae, group, split_dim=split_dim)
 
     if z.shape[2] == 0:
-        raise ValueError("Wan SP VAE decode expects at least one latent frame.")
+        raise ValueError("Wan spatial-shard VAE decode expects at least one latent frame.")
 
     # Non-rank-0 ranks must still run the decoder every chunk to stay in lockstep with
     # the halo/all-gather collectives; they just skip keeping/assembling the output.

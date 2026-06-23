@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Benchmark Wan VAE tiled and spatially-sharded (SP) decode against a non-parallel reference.
+"""Benchmark Wan VAE tiled and spatially-sharded decode against a non-parallel reference.
 
 Each timed mode (``--modes``) is compared against a standard non-parallel reference decode
 (untiled, single-process) which serves as the ground truth. This makes the deltas independent
-of the tile-parallel path, so a tiled-decode bug cannot mask SP errors. Pass ``--skip-reference``
+of the tile-parallel path, so a tiled-decode bug cannot mask spatial-shard errors. Pass ``--skip-reference``
 to disable the reference when the full decode does not fit in memory.
 
 All ranks must see every GPU (the distributed stack maps rank -> cuda:LOCAL_RANK), so make sure
@@ -15,23 +15,23 @@ VAE used by Cosmos3 (nvidia/Cosmos3-Nano / -Super, subfolder "vae").
 
 Example (Cosmos3 VAE):
     CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc-per-node 4 \
-        benchmarks/diffusion/benchmark_wan_vae_sp_decode.py \
+        benchmarks/diffusion/benchmark_wan_vae_spatial_shard_decode.py \
         --model nvidia/Cosmos3-Nano --subfolder vae \
         --vae-parallel-size 4 --sample-height 720 --sample-width 1280 \
-        --latent-frames 21 --dtype bfloat16 --modes tiled sp_width
+        --latent-frames 21 --dtype bfloat16 --modes tiled spatial_shard_width
 
 Example (Wan2.2 VAE, the same architecture Cosmos3 uses):
     CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc-per-node 4 \
-        benchmarks/diffusion/benchmark_wan_vae_sp_decode.py \
+        benchmarks/diffusion/benchmark_wan_vae_spatial_shard_decode.py \
         --model Wan-AI/Wan2.2-TI2V-5B-Diffusers --subfolder vae \
         --vae-parallel-size 4 --sample-height 720 --sample-width 1280 \
-        --latent-frames 21 --dtype bfloat16 --modes tiled sp_width
+        --latent-frames 21 --dtype bfloat16 --modes tiled spatial_shard_width
 
 Example (Wan2.1 VAE):
     CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc-per-node 4 \
-        benchmarks/diffusion/benchmark_wan_vae_sp_decode.py \
+        benchmarks/diffusion/benchmark_wan_vae_spatial_shard_decode.py \
         --model Wan-AI/Wan2.1-T2V-1.3B-Diffusers --subfolder vae \
-        --vae-parallel-size 4 --modes tiled sp_width
+        --vae-parallel-size 4 --modes tiled spatial_shard_width
 """
 
 from __future__ import annotations
@@ -141,7 +141,7 @@ def _make_latents(args: argparse.Namespace, vae: DistributedAutoencoderKLWan, de
 
 def _vae_parallel_mode(mode: str) -> str:
     """Map a benchmark mode to the corresponding DiffusionParallelConfig.vae_parallel_mode."""
-    if mode in ("sp_height", "sp_width"):
+    if mode in ("spatial_shard_height", "spatial_shard_width"):
         return mode
     return "tile"
 
@@ -200,8 +200,8 @@ def _reference_decode(
     """Standard non-parallel VAE decode (untiled, single-process) used as the delta baseline.
 
     This is the ground-truth reference: it disables tiling and VAE parallelism so neither the
-    tile-parallel nor the spatially-sharded path is exercised. It must run before any SP decode,
-    since SP patches the decoder in place. The result is timed like the other modes so its latency
+    tile-parallel nor the spatially-sharded path is exercised. It must run before any
+    spatial-shard decode, since spatial-shard patches the decoder in place. The result is timed like the other modes so its latency
     and peak memory can be compared directly.
     """
     old_use_tiling = vae.use_tiling
@@ -249,8 +249,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--modes",
         nargs="+",
-        choices=["tiled", "sp_height", "sp_width"],
-        default=["tiled", "sp_width"],
+        choices=["tiled", "spatial_shard_height", "spatial_shard_width"],
+        default=["tiled", "spatial_shard_width"],
         help="Decode modes to time. The standard non-parallel decode is always run separately as the "
         "reference baseline (unless --skip-reference), so it is not listed here.",
     )
@@ -269,8 +269,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def _ordered_modes(modes: list[str]) -> list[str]:
-    # SP modes patch the decoder in-place, so run the tile mode first.
-    order = {"tiled": 0, "sp_height": 1, "sp_width": 1}
+    # Spatial-shard modes patch the decoder in-place, so run the tile mode first.
+    order = {"tiled": 0, "spatial_shard_height": 1, "spatial_shard_width": 1}
     return sorted(dict.fromkeys(modes), key=lambda mode: order[mode])
 
 
@@ -290,13 +290,14 @@ def main() -> None:
 
     latents = _make_latents(args, vae, device)
     modes = _ordered_modes(args.modes)
-    if "sp_height" in modes and "sp_width" in modes:
+    if "spatial_shard_height" in modes and "spatial_shard_width" in modes:
         raise ValueError(
-            "Run sp_height and sp_width in separate benchmark invocations; both patch the decoder in-place."
+            "Run spatial_shard_height and spatial_shard_width in separate benchmark invocations; "
+            "both patch the decoder in-place."
         )
 
-    # Compute the ground-truth reference first (standard non-parallel decode), before any SP run
-    # patches the decoder in place. All timed modes are compared against this baseline.
+    # Compute the ground-truth reference first (standard non-parallel decode), before any
+    # spatial-shard run patches the decoder in place. All timed modes are compared against this baseline.
     reference = (
         None
         if args.skip_reference

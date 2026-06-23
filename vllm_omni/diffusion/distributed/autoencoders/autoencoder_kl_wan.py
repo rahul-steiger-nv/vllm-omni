@@ -11,7 +11,7 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
 from diffusers.models.autoencoders.vae import DecoderOutput
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.distributed.autoencoders import wan_sp_parallel
+from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
     DistributedOperator,
     DistributedVaeMixin,
@@ -270,16 +270,16 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
         dec = torch.clamp(dec, min=-1.0, max=1.0)
         return dec
 
-    def _sp_decode_split_dim(self) -> str | None:
+    def _spatial_shard_decode_split_dim(self) -> str | None:
         mode = self.distributed_executor.parallel_mode
-        if mode == "sp_width":
+        if mode == "spatial_shard_width":
             return "width"
-        if mode == "sp_height":
+        if mode == "spatial_shard_height":
             return "height"
         return None
 
-    def _sp_decode_enabled(self, z: torch.Tensor) -> bool:
-        split_dim = self._sp_decode_split_dim()
+    def _spatial_shard_decode_enabled(self, z: torch.Tensor) -> bool:
+        split_dim = self._spatial_shard_decode_split_dim()
         if split_dim is None:
             return False
         if z.ndim != 5:
@@ -307,10 +307,10 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
         if not self.is_distributed_enabled():
             return super().tiled_decode(z, return_dict=return_dict)
 
-        if self._sp_decode_enabled(z):
-            split_dim = self._sp_decode_split_dim()
-            logger.debug("Decode running with Wan VAE sp_%s mode", split_dim)
-            return wan_sp_parallel.sp_parallel_decode(
+        if self._spatial_shard_decode_enabled(z):
+            split_dim = self._spatial_shard_decode_split_dim()
+            logger.debug("Decode running with Wan VAE spatial_shard_%s mode", split_dim)
+            return wan_spatial_shard.spatial_shard_decode(
                 self,
                 z,
                 group=self.distributed_executor.group,
