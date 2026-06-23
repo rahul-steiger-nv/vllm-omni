@@ -98,6 +98,7 @@ def test_model_level_backend_delegates_to_custom_pipeline_offload() -> None:
         "device": torch.device("cpu"),
         "pin_memory": False,
         "use_hsdp": False,
+        "use_flat_storage": False,
     }
 
     backend.disable()

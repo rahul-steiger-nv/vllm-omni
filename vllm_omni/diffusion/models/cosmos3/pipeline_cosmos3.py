@@ -792,6 +792,7 @@ class Cosmos3OmniDiffusersPipeline(
         device: torch.device,
         pin_memory: bool = True,
         use_hsdp: bool = False,
+        use_flat_storage: bool = True,
     ) -> None:
         """Enable Cosmos3 pathway-level model offload.
 
@@ -799,6 +800,10 @@ class Cosmos3OmniDiffusersPipeline(
         text-encoder and DiT pipeline components, so the transformer owns the
         mutual-exclusion swaps.  The VAE stays resident on GPU like the generic
         model-level offloader.
+
+        ``use_flat_storage`` selects the packed pinned-CPU + reusable-arena swap
+        (default) vs. the ``.to()`` baseline that reuses ``SequentialOffloadHook``,
+        so the two can be A/B compared via ``offload_use_flat_storage``.
         """
         self.vae.to(device, non_blocking=True)
         if isinstance(self._sound_tokenizer, nn.Module):
@@ -807,6 +812,7 @@ class Cosmos3OmniDiffusersPipeline(
             device=device,
             pin_memory=pin_memory,
             use_hsdp=use_hsdp,
+            use_flat_storage=use_flat_storage,
         )
 
     def disable_omni_model_cpu_offload(self) -> None:

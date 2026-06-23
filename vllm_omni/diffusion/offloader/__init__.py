@@ -14,6 +14,7 @@ from .flat_storage import (
     FlatModelCPUOffloadMixin,
     FlatModuleOffloadArena,
     FlatModuleOffloadGroup,
+    NaiveGroupOffloadManager,
 )
 from .layerwise_backend import LayerWiseOffloadBackend
 from .sequential_backend import (
@@ -32,6 +33,7 @@ __all__ = [
     "ModelLevelOffloadBackend",
     "FlatModelLevelOffloadBackend",
     "FlatGroupOffloadManager",
+    "NaiveGroupOffloadManager",
     "FlatModelCPUOffloadMixin",
     "FlatModuleOffloadGroup",
     "FlatModuleOffloadArena",

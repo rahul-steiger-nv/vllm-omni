@@ -87,6 +87,7 @@ class FlatModelLevelOffloadBackend(OffloadBackend):
                 device=self.device,
                 pin_memory=self.config.pin_cpu_memory,
                 use_hsdp=self.config.use_hsdp,
+                use_flat_storage=self.config.use_flat_storage,
             )
             self._custom_pipeline = pipeline
             self.enabled = True

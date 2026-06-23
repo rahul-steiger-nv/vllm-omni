@@ -11,7 +11,11 @@ from torch import nn
 
 from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
 from vllm_omni.diffusion.offloader.flat_backend import FlatGroupOffloadHook, FlatModelLevelOffloadBackend
-from vllm_omni.diffusion.offloader.flat_storage import FlatGroupOffloadManager, FlatModelCPUOffloadMixin
+from vllm_omni.diffusion.offloader.flat_storage import (
+    FlatGroupOffloadManager,
+    FlatModelCPUOffloadMixin,
+    NaiveGroupOffloadManager,
+)
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 
@@ -148,6 +152,26 @@ def test_offload_mixin_declarative_groups_and_residents() -> None:
     assert model._offload_manager is None
 
 
+def test_offload_mixin_uses_naive_to_manager_when_flat_disabled() -> None:
+    model = _ToyMixinModule()
+
+    # use_flat_storage=False selects the .to() baseline (reuses SequentialOffloadHook).
+    model.enable_model_cpu_offload(device=torch.device("cpu"), pin_memory=False, use_flat_storage=False)
+    manager = model._offload_manager
+    assert isinstance(manager, NaiveGroupOffloadManager)
+    assert not isinstance(manager, FlatGroupOffloadManager)
+    assert set(manager.groups) == {"reasoner", "generator"}
+    assert model.device == torch.device("cpu")
+
+    out = model(torch.zeros(1, 2))
+    assert tuple(out.shape) == (1, 2)
+    # The context-driven swap tracks the active pathway through the same call sites.
+    assert manager.active_group == "generator"
+
+    model.disable_model_cpu_offload()
+    assert model._offload_manager is None
+
+
 def test_offload_mixin_rejects_missing_group_module() -> None:
     class BadModule(FlatModelCPUOffloadMixin, nn.Module):
         _offload_group_specs = {"a": ["does_not_exist"]}
@@ -226,6 +250,7 @@ def test_flat_model_level_backend_delegates_to_custom_pipeline_offload() -> None
         "device": torch.device("cpu"),
         "pin_memory": False,
         "use_hsdp": False,
+        "use_flat_storage": True,
     }
 
     backend.disable()

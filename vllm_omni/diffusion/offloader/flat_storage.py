@@ -396,6 +396,113 @@ class FlatGroupOffloadManager:
         yield
 
 
+class NaiveGroupOffloadManager:
+    """Baseline ``.to()`` group swap that reuses ``SequentialOffloadHook``.
+
+    Drop-in alternative to :class:`FlatGroupOffloadManager` with the same
+    interface (``enable``/``disable``/``activate``/``context``/``device``/
+    ``enabled``).  Instead of packing groups into a pinned-CPU + reusable-arena
+    layout, it moves each group's modules between CPU and the device using the
+    existing model-level ``.to()`` movers
+    (:meth:`SequentialOffloadHook._to_cpu` / :meth:`._to_gpu`) -- i.e. the
+    pre-flat-storage path, with its pin_memory / DTensor / XPU / ``empty_cache``
+    handling reused verbatim.  This exists so callers can A/B the packed-arena
+    path against the naive ``.to()`` path through the same offload-context call
+    sites (e.g. via ``use_flat_storage``), keeping the comparison apples-to-apples.
+    """
+
+    def __init__(
+        self,
+        group_specs: dict[str, list[nn.Module]],
+        *,
+        device: torch.device,
+        resident_modules: Iterable[nn.Module] | None = None,
+        resident_parameters: Iterable[nn.Parameter] | None = None,
+        resident_buffers: Iterable[torch.Tensor] | None = None,
+        pin_memory: bool = True,
+        use_hsdp: bool = False,
+    ) -> None:
+        if not group_specs:
+            raise ValueError("NaiveGroupOffloadManager requires at least one group spec")
+        # Local import avoids import-order coupling between offloader submodules.
+        from .sequential_backend import SequentialOffloadHook
+
+        self.device = torch.device(device)
+        self.groups = {name: list(modules) for name, modules in group_specs.items()}
+        self._resident_modules = list(resident_modules) if resident_modules is not None else []
+        self._resident_parameters = list(resident_parameters) if resident_parameters is not None else []
+        self._resident_buffers = list(resident_buffers) if resident_buffers is not None else []
+        # Reuse the existing model-level .to swap logic. We don't register the
+        # hook on any forward (no offload_targets); we only borrow its
+        # _to_cpu/_to_gpu movers and drive them at Cosmos3's phase boundaries.
+        self._mover = SequentialOffloadHook(
+            offload_targets=[], device=self.device, pin_memory=pin_memory, use_hsdp=use_hsdp
+        )
+        self.enabled = False
+        self.active_group: str | None = None
+
+    def _move_residents(self) -> None:
+        for module in self._resident_modules:
+            self._mover._to_gpu(module)
+        with torch.no_grad():
+            for param in self._resident_parameters:
+                if param is not None and param.data.device != self.device:
+                    param.data = param.data.to(self.device, non_blocking=True)
+            for buffer in self._resident_buffers:
+                if buffer is not None and buffer.device != self.device:
+                    buffer.data = buffer.data.to(self.device, non_blocking=True)
+
+    def _offload_group(self, name: str) -> None:
+        for module in self.groups[name]:
+            self._mover._to_cpu(module)
+
+    def _load_group(self, name: str) -> None:
+        for module in self.groups[name]:
+            self._mover._to_gpu(module)
+
+    def enable(self) -> None:
+        if self.enabled:
+            return
+        self._move_residents()
+        for name in self.groups:
+            self._offload_group(name)
+        self.enabled = True
+        self.active_group = None
+        logger.info(
+            "Naive (.to) model-level CPU offload enabled: groups %s swap on %s",
+            list(self.groups),
+            self.device,
+        )
+
+    def disable(self) -> None:
+        if not self.enabled:
+            return
+        for name in self.groups:
+            self._load_group(name)
+        if self.device.type != "cpu":
+            current_omni_platform.synchronize()
+        self.enabled = False
+        self.active_group = None
+
+    def activate(self, name: str) -> None:
+        if not self.enabled:
+            return
+        if name not in self.groups:
+            raise ValueError(f"Unknown offload group: {name!r} (known: {list(self.groups)})")
+        if self.active_group == name:
+            return
+        for other in self.groups:
+            if other != name:
+                self._offload_group(other)
+        self._load_group(name)
+        self.active_group = name
+
+    @contextmanager
+    def context(self, name: str) -> Iterator[None]:
+        self.activate(name)
+        yield
+
+
 class FlatModelCPUOffloadMixin:
     """Declarative in-forward flat-storage CPU offload for a single ``nn.Module``.
 
@@ -428,7 +535,7 @@ class FlatModelCPUOffloadMixin:
 
     # Set on enable(); the class default lets ``device`` work before __init__ runs
     # and for instances that never enable offload.
-    _offload_manager: FlatGroupOffloadManager | None = None
+    _offload_manager: FlatGroupOffloadManager | NaiveGroupOffloadManager | None = None
 
     def _resolve_offload_module(self, path: str) -> nn.Module | None:
         obj: Any = self
@@ -474,9 +581,20 @@ class FlatModelCPUOffloadMixin:
         device: torch.device,
         pin_memory: bool = True,
         use_hsdp: bool = False,
+        use_flat_storage: bool = True,
     ) -> None:
-        """Build the offload manager from the declared groups and enable it."""
-        manager = FlatGroupOffloadManager(
+        """Build the offload manager from the declared groups and enable it.
+
+        ``use_flat_storage=True`` (default) uses the packed pinned-CPU +
+        reusable-arena :class:`FlatGroupOffloadManager`; ``False`` uses
+        :class:`NaiveGroupOffloadManager`, the ``.to()`` baseline that reuses the
+        existing ``SequentialOffloadHook`` movers -- so the two can be A/B
+        compared through the same offload-context call sites.
+        """
+        manager_cls: type[FlatGroupOffloadManager] | type[NaiveGroupOffloadManager] = (
+            FlatGroupOffloadManager if use_flat_storage else NaiveGroupOffloadManager
+        )
+        manager = manager_cls(
             self._build_offload_group_specs(),
             device=torch.device(device),
             resident_modules=self._offload_resident_module_list(),
