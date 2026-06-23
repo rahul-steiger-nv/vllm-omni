@@ -154,6 +154,12 @@ def split_for_parallel_decode(
         rank, world_size = _rank_world(group)
     rank = 0 if rank is None else int(rank)
     world_size = 1 if world_size is None else int(world_size)
+    if world_size < 1:
+        raise ValueError(f"Wan VAE world_size must be >= 1, got {world_size}.")
+    if not 0 <= rank < world_size:
+        raise ValueError(
+            f"Wan VAE rank must satisfy 0 <= rank < world_size, got rank={rank}, world_size={world_size}."
+        )
 
     dim = _spatial_dim(split_dim)
     expected_extent = x.shape[dim] * (2**upsample_count)

@@ -51,6 +51,43 @@ def test_split_for_parallel_decode_pads_uneven_width():
     assert torch.equal(local[..., :, 1], torch.zeros_like(local[..., :, 1]))
 
 
+def test_split_for_parallel_decode_rejects_invalid_split_dim():
+    x = torch.zeros((1, 1, 1, 4, 4), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="split_dim"):
+        wan_sp_parallel.split_for_parallel_decode(
+            x,
+            upsample_count=1,
+            split_dim="depth",
+            rank=0,
+            world_size=2,
+        )
+
+
+def test_split_for_parallel_decode_rejects_zero_world_size():
+    x = torch.zeros((1, 1, 1, 4, 4), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="world_size"):
+        wan_sp_parallel.split_for_parallel_decode(
+            x,
+            upsample_count=1,
+            rank=0,
+            world_size=0,
+        )
+
+
+def test_split_for_parallel_decode_rejects_rank_out_of_range():
+    x = torch.zeros((1, 1, 1, 4, 4), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="rank"):
+        wan_sp_parallel.split_for_parallel_decode(
+            x,
+            upsample_count=1,
+            rank=3,
+            world_size=3,
+        )
+
+
 def test_gather_and_trim_height(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(wan_sp_parallel, "_rank_world", lambda group: (0, 3))
 
