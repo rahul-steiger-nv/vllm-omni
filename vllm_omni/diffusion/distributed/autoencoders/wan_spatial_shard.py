@@ -157,9 +157,7 @@ def split_for_parallel_decode(
     if world_size < 1:
         raise ValueError(f"Wan VAE world_size must be >= 1, got {world_size}.")
     if not 0 <= rank < world_size:
-        raise ValueError(
-            f"Wan VAE rank must satisfy 0 <= rank < world_size, got rank={rank}, world_size={world_size}."
-        )
+        raise ValueError(f"Wan VAE rank must satisfy 0 <= rank < world_size, got rank={rank}, world_size={world_size}.")
 
     dim = _spatial_dim(split_dim)
     expected_extent = x.shape[dim] * (2**upsample_count)
@@ -760,9 +758,7 @@ def install_wan_spatial_shard_decode(vae: Any, group: dist.ProcessGroup, split_d
             out = orig_forward(x, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk)
         finally:
             _SPATIAL_SHARD_CONTEXT.reset(token)
-        return gather_and_trim_extent(
-            out, expected_extent=expected_extent, split_dim=split_dim, group=group, dst=0
-        )
+        return gather_and_trim_extent(out, expected_extent=expected_extent, split_dim=split_dim, group=group, dst=0)
 
     decoder.forward = MethodType(_forward, decoder)
     vae._vllm_omni_wan_spatial_shard_installed = True

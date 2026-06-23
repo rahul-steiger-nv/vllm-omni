@@ -130,9 +130,7 @@ def test_gather_and_trim_rank0_only_assembles_on_rank0(monkeypatch: pytest.Monke
     monkeypatch.setattr(wan_spatial_shard.dist, "all_gather", fake_all_gather)
 
     x = torch.zeros((1, 1, 1, 2, 1), dtype=torch.float32)
-    out = wan_spatial_shard.gather_and_trim_extent(
-        x, expected_extent=5, split_dim="height", group=object(), dst=0
-    )
+    out = wan_spatial_shard.gather_and_trim_extent(x, expected_extent=5, split_dim="height", group=object(), dst=0)
 
     assert out.shape == (1, 1, 1, 5, 1)
     assert torch.equal(out.flatten(), torch.tensor([0.0, 0.0, 1.0, 1.0, 2.0]))
@@ -152,9 +150,7 @@ def test_gather_and_trim_rank0_only_returns_empty_on_non_zero_rank(monkeypatch: 
     monkeypatch.setattr(wan_spatial_shard.dist, "all_gather", fake_all_gather)
 
     x = torch.ones((1, 1, 1, 2, 1), dtype=torch.float32)
-    out = wan_spatial_shard.gather_and_trim_extent(
-        x, expected_extent=5, split_dim="height", group=object(), dst=0
-    )
+    out = wan_spatial_shard.gather_and_trim_extent(x, expected_extent=5, split_dim="height", group=object(), dst=0)
 
     assert gathered_sizes == [3]
     assert out.numel() == 0
@@ -333,16 +329,26 @@ def _spatial_shard_decode_worker(rank: int, split_dim: str, return_dict, master_
 
     backend = current_omni_platform.dist_backend
     init_distributed_environment(world_size=_SPATIAL_SHARD_WORLD_SIZE, rank=rank, local_rank=rank, backend=backend)
-    initialize_model_parallel(sequence_parallel_size=_SPATIAL_SHARD_WORLD_SIZE, ulysses_degree=_SPATIAL_SHARD_WORLD_SIZE, backend=backend)
+    initialize_model_parallel(
+        sequence_parallel_size=_SPATIAL_SHARD_WORLD_SIZE, ulysses_degree=_SPATIAL_SHARD_WORLD_SIZE, backend=backend
+    )
 
     try:
-        vae = DistributedAutoencoderKLWan.from_pretrained(_SPATIAL_SHARD_MODEL, subfolder=_SPATIAL_SHARD_SUBFOLDER, torch_dtype=dtype)
+        vae = DistributedAutoencoderKLWan.from_pretrained(
+            _SPATIAL_SHARD_MODEL, subfolder=_SPATIAL_SHARD_SUBFOLDER, torch_dtype=dtype
+        )
         vae.to(device=device, dtype=dtype)
         vae.eval()
 
         generator = torch.Generator(device=device).manual_seed(0)
         latents = torch.randn(
-            (1, vae.config.z_dim, _SPATIAL_SHARD_LATENT_FRAMES, _SPATIAL_SHARD_LATENT_HEIGHT, _SPATIAL_SHARD_LATENT_WIDTH),
+            (
+                1,
+                vae.config.z_dim,
+                _SPATIAL_SHARD_LATENT_FRAMES,
+                _SPATIAL_SHARD_LATENT_HEIGHT,
+                _SPATIAL_SHARD_LATENT_WIDTH,
+            ),
             generator=generator,
             device=device,
             dtype=dtype,
@@ -403,5 +409,9 @@ def test_spatial_shard_decode_matches_reference(split_dim: str):
         f"spatial_shard_{split_dim} vs reference: max_abs_diff={max_abs_diff:.6e} "
         f"mean_abs_diff={mean_abs_diff:.6e} shape={return_dict.get('shape')}"
     )
-    assert max_abs_diff <= _SPATIAL_SHARD_TOLERANCE, f"spatial_shard_{split_dim} max_abs_diff {max_abs_diff} exceeds {_SPATIAL_SHARD_TOLERANCE}"
-    assert mean_abs_diff <= _SPATIAL_SHARD_TOLERANCE, f"spatial_shard_{split_dim} mean_abs_diff {mean_abs_diff} exceeds {_SPATIAL_SHARD_TOLERANCE}"
+    assert max_abs_diff <= _SPATIAL_SHARD_TOLERANCE, (
+        f"spatial_shard_{split_dim} max_abs_diff {max_abs_diff} exceeds {_SPATIAL_SHARD_TOLERANCE}"
+    )
+    assert mean_abs_diff <= _SPATIAL_SHARD_TOLERANCE, (
+        f"spatial_shard_{split_dim} mean_abs_diff {mean_abs_diff} exceeds {_SPATIAL_SHARD_TOLERANCE}"
+    )
