@@ -120,6 +120,46 @@ def test_gather_and_trim_width(monkeypatch: pytest.MonkeyPatch):
     assert torch.equal(out.flatten(), torch.tensor([0.0, 0.0, 1.0, 1.0, 2.0]))
 
 
+def test_gather_and_trim_rank0_only_assembles_on_rank0(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(wan_sp_parallel, "_rank_world", lambda group: (0, 3))
+
+    def fake_all_gather(gathered, x, group=None):
+        for idx, output in enumerate(gathered):
+            output.copy_(x + idx)
+
+    monkeypatch.setattr(wan_sp_parallel.dist, "all_gather", fake_all_gather)
+
+    x = torch.zeros((1, 1, 1, 2, 1), dtype=torch.float32)
+    out = wan_sp_parallel.gather_and_trim_extent(
+        x, expected_extent=5, split_dim="height", group=object(), dst=0
+    )
+
+    assert out.shape == (1, 1, 1, 5, 1)
+    assert torch.equal(out.flatten(), torch.tensor([0.0, 0.0, 1.0, 1.0, 2.0]))
+
+
+def test_gather_and_trim_rank0_only_returns_empty_on_non_zero_rank(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(wan_sp_parallel, "_rank_world", lambda group: (1, 3))
+
+    gathered_sizes = []
+
+    def fake_all_gather(gathered, x, group=None):
+        # Every rank must still take part in the collective even when it discards the result.
+        gathered_sizes.append(len(gathered))
+        for output in gathered:
+            output.copy_(x)
+
+    monkeypatch.setattr(wan_sp_parallel.dist, "all_gather", fake_all_gather)
+
+    x = torch.ones((1, 1, 1, 2, 1), dtype=torch.float32)
+    out = wan_sp_parallel.gather_and_trim_extent(
+        x, expected_extent=5, split_dim="height", group=object(), dst=0
+    )
+
+    assert gathered_sizes == [3]
+    assert out.numel() == 0
+
+
 def test_reshard_from_trimmed_height_pads_invalid_rows(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(wan_sp_parallel, "_rank_world", lambda group: (2, 3))
 
@@ -321,8 +361,10 @@ def _sp_decode_worker(rank: int, split_dim: str, return_dict, master_port: str) 
             vae.set_parallel_size(_SP_WORLD_SIZE, mode=f"sp_{split_dim}")
             sharded = vae.decode(latents, return_dict=False)[0].float()
 
-        diff = (sharded - reference).abs()
+        # Only rank 0 assembles the full decoded sample (matching broadcast_result=False);
+        # non-zero ranks return an empty placeholder, so the comparison runs on rank 0 only.
         if rank == 0:
+            diff = (sharded - reference).abs()
             return_dict["max_abs_diff"] = diff.max().item()
             return_dict["mean_abs_diff"] = diff.mean().item()
             return_dict["shape"] = tuple(sharded.shape)

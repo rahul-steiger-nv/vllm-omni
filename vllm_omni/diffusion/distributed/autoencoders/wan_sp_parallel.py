@@ -173,13 +173,23 @@ def split_for_parallel_decode(
     return _narrow_along_dim(x, dim, rank * chunk_size, chunk_size).contiguous(), expected_extent
 
 
-def all_gather_along_dim(x: torch.Tensor, *, group: dist.ProcessGroup, dim: int) -> torch.Tensor:
-    _, world_size = _rank_world(group)
+def all_gather_along_dim(
+    x: torch.Tensor,
+    *,
+    group: dist.ProcessGroup,
+    dim: int,
+    dst: int | None = None,
+) -> torch.Tensor:
+    rank, world_size = _rank_world(group)
     if world_size <= 1:
         return x
     x = _maybe_contiguous_for_sp_gather(x)
     gathered = [torch.empty_like(x) for _ in range(world_size)]
+    # NCCL has no rank-local gather, so every rank joins the collective; only ``dst``
+    # keeps the assembled tensor while the rest drop their copies.
     dist.all_gather(gathered, x.contiguous(), group=group)
+    if dst is not None and rank != dst:
+        return x.new_zeros(0)
     return torch.cat(gathered, dim=dim)
 
 
@@ -209,9 +219,13 @@ def gather_and_trim_extent(
     expected_extent: int | None,
     split_dim: str,
     group: dist.ProcessGroup,
+    dst: int | None = None,
 ) -> torch.Tensor:
     dim = _spatial_dim(split_dim)
-    out = all_gather_along_dim(x, group=group, dim=dim)
+    rank, _ = _rank_world(group)
+    out = all_gather_along_dim(x, group=group, dim=dim, dst=dst)
+    if dst is not None and rank != dst:
+        return out
     if expected_extent is not None and out.shape[dim] != expected_extent:
         out = _narrow_along_dim(out, dim, 0, expected_extent).contiguous()
     return out
@@ -693,6 +707,10 @@ def install_wan_sp_parallel_decode(vae: Any, group: dist.ProcessGroup, split_dim
     instance is bound to a single ``split_dim``; switching between
     ``"height"`` and ``"width"`` requires a fresh VAE instance and raises here
     otherwise.
+
+    Only group-relative rank 0 assembles the final decoded frame, mirroring the
+    distributed tiled-decode ``broadcast_result=False`` contract; the other ranks
+    take part in the collectives but return an empty placeholder.
     """
     _spatial_dim(split_dim)
     if getattr(vae, "_vllm_omni_wan_sp_parallel_installed", False):
@@ -742,7 +760,9 @@ def install_wan_sp_parallel_decode(vae: Any, group: dist.ProcessGroup, split_dim
             out = orig_forward(x, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk)
         finally:
             _SPATIAL_SHARD_CONTEXT.reset(token)
-        return gather_and_trim_extent(out, expected_extent=expected_extent, split_dim=split_dim, group=group)
+        return gather_and_trim_extent(
+            out, expected_extent=expected_extent, split_dim=split_dim, group=group, dst=0
+        )
 
     decoder.forward = MethodType(_forward, decoder)
     vae._vllm_omni_wan_sp_parallel_installed = True
@@ -760,6 +780,14 @@ def sp_parallel_decode(
 ) -> DecoderOutput | tuple[torch.Tensor]:
     install_wan_sp_parallel_decode(vae, group, split_dim=split_dim)
 
+    if z.shape[2] == 0:
+        raise ValueError("Wan SP VAE decode expects at least one latent frame.")
+
+    # Non-rank-0 ranks must still run the decoder every chunk to stay in lockstep with
+    # the halo/all-gather collectives; they just skip keeping/assembling the output.
+    rank, world_size = _rank_world(group)
+    produce_output = world_size <= 1 or rank == 0
+
     vae.clear_cache()
     try:
         context = vae._execution_context() if hasattr(vae, "_execution_context") else nullcontext()
@@ -768,22 +796,22 @@ def sp_parallel_decode(
             decoded_chunks = []
             for i in range(z.shape[2]):
                 vae._conv_idx = [0]
-                decoded_chunks.append(
-                    vae.decoder(
-                        x[:, :, i : i + 1, :, :],
-                        feat_cache=vae._feat_map,
-                        feat_idx=vae._conv_idx,
-                        first_chunk=(i == 0),
-                    )
+                chunk = vae.decoder(
+                    x[:, :, i : i + 1, :, :],
+                    feat_cache=vae._feat_map,
+                    feat_idx=vae._conv_idx,
+                    first_chunk=(i == 0),
                 )
+                if produce_output:
+                    decoded_chunks.append(chunk)
 
-            if not decoded_chunks:
-                raise ValueError("Wan SP VAE decode expects at least one latent frame.")
-            out = torch.cat(decoded_chunks, dim=2)
-
-            if vae.config.patch_size is not None:
-                out = unpatchify(out, patch_size=vae.config.patch_size)
-            out = torch.clamp(out, min=-1.0, max=1.0)
+            if produce_output:
+                out = torch.cat(decoded_chunks, dim=2)
+                if vae.config.patch_size is not None:
+                    out = unpatchify(out, patch_size=vae.config.patch_size)
+                out = torch.clamp(out, min=-1.0, max=1.0)
+            else:
+                out = z.new_zeros(0)
     finally:
         vae.clear_cache()
 

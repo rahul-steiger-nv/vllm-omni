@@ -458,7 +458,7 @@ The tile-parallel executor above assigns independent spatial **tiles** to ranks.
 |--------|--------------------------|-----------------------------------------------|
 | Unit of work | Independent overlapping tiles | A single global feature map sharded along H or W |
 | Cross-rank communication | Gather tiles to rank 0, stitch + blend | Per-conv **halo exchange** of boundary rows/cols (P2P) |
-| Output assembly | Blend overlapping tiles | All-gather shards, trim padding |
+| Output assembly | Blend overlapping tiles | All-gather shards on rank 0, trim padding (matches `broadcast_result=False`) |
 | Scope | Decode + encode | Decode only |
 
 SP decode swaps the decoder's spatial convolutions/padding for halo-exchanging variants (`WanDistConv2d`, `WanDistCausalConv3d`, `WanDistZeroPad2d`) so each rank only holds a shard of the activations but still sees the correct receptive field at shard boundaries. Implementation lives in `vllm_omni/diffusion/distributed/autoencoders/wan_sp_parallel.py`.
