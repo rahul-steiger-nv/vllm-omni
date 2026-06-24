@@ -8,8 +8,7 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
-from vllm_omni.diffusion.offloader.sequential_backend import ModelLevelOffloadBackend
-from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
+from vllm_omni.diffusion.offloader.sequential_backend import ModelLevelOffloadBackend, SequentialOffloadHook
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
