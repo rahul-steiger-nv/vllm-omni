@@ -36,6 +36,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.norm import RMSNorm as _VllmRMSNorm
+from vllm_omni.diffusion.offloader.group_offload import ModelCPUOffloadMixin
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -869,6 +870,8 @@ class Cosmos3LanguageModel(nn.Module):
     computed once and reused across all sampling steps.
     """
 
+    _layerwise_offload_blocks_attrs = ["layers"]
+
     def __init__(
         self,
         *,
@@ -952,20 +955,36 @@ class Cosmos3GenSPPrepare(nn.Module):
         return hidden_gen, freqs_cos, freqs_sin
 
 
-class Cosmos3VFMTransformer(nn.Module):
+class Cosmos3VFMTransformer(ModelCPUOffloadMixin, nn.Module):
     """Cosmos3 VFM Transformer: UND language model + GEN denoising layers.
 
     The UND pathway runs once per generation (K/V cached). The GEN pathway
     runs at each denoising step over the target video/image latent stream and
     optional transfer-control, action, and sound latent streams.
 
-    Layerwise offloading uses ``gen_layers`` as the block container.
+    Layerwise offloading uses ``gen_layers`` as the GEN block container.  The
+    nested UND language model declares its own ``layers`` container so the two
+    pathways are offloaded as independent rings.
+
+    Model-level CPU offload reuses :class:`ModelCPUOffloadMixin`: the UND
+    ``reasoner`` and GEN ``generator`` components are declared as mutually
+    exclusive offload groups (see ``_offload_group_specs``), and the forward
+    wraps each phase in ``with self._offload_context(...)``.
 
     Sequence parallelism uses ``_sp_plan`` to shard/gather the GEN pathway at
     module boundaries. ``Cosmos3CrossAttention`` checks
     ``forward_context.sp_active`` at runtime and routes to the framework
     ``Attention`` layer (with Ulysses all-to-all) or plain SDPA accordingly.
     """
+
+    # Mutually-exclusive in-forward offload pathways: the understanding (UND)
+    # language model and the generation (GEN) denoising layers.  Everything else
+    # (embeddings, projections, norms, time/SP helpers) is inferred as resident
+    # by the manager, so no resident list is enumerated here.
+    _offload_group_specs = {
+        "reasoner": ["language_model.layers"],
+        "generator": ["gen_layers"],
+    }
 
     _cache_dit_adapter_config = CacheDiTAdapterConfig(
         # Cosmos3 GEN blocks return only hidden_states.  Per-layer UND K/V
@@ -1148,9 +1167,10 @@ class Cosmos3VFMTransformer(nn.Module):
         self.cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
         self.cached_freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None
 
-    @property
-    def device(self) -> torch.device:
-        return next(self.parameters()).device
+    # Reasoner/generator component-level CPU offload is provided by
+    # ModelCPUOffloadMixin via the ``_offload_group_specs`` declaration above;
+    # ``enable_model_cpu_offload``, ``disable_model_cpu_offload``,
+    # ``_offload_context`` and the ``device`` override are inherited from the mixin.
 
     # -- Patchify / Unpatchify -----------------------------------------------
 
@@ -1483,26 +1503,14 @@ class Cosmos3VFMTransformer(nn.Module):
         # Query Ulysses state at runtime
         ulysses_size, _, _ = _get_ulysses_state()
 
-        # Patchify latents and project to hidden space
-        hidden_video = self.proj_in(self.patchify(hidden_states, t, h, w))
-        s_video = hidden_video.shape[1]
-        s_control = 0
-        hidden_controls: list[torch.Tensor] = []
-        for idx, control in enumerate(control_latent_list):
-            if control.shape != hidden_states.shape:
-                raise ValueError(
-                    "Cosmos3 transfer control latent shape must match target latent shape: "
-                    f"control[{idx}]={tuple(control.shape)}, target={tuple(hidden_states.shape)}."
-                )
-            hidden_control = self.proj_in(
-                self.patchify(control.to(device=hidden_states.device, dtype=hidden_states.dtype), t, h, w)
-            )
-            hidden_controls.append(hidden_control)
-            s_control += hidden_control.shape[1]
+        # Pack action/sound tokens (no learned weights) up front so the UND
+        # cache sizing knows their token lengths.  The modality projections are
+        # deferred into the generator offload context below, so model-level
+        # offload does not stage GEN weights before swapping to the reasoner.
+        action_tokens = None
+        sound_tokens = None
         s_action = 0
-        hidden_action = None
         s_sound = 0
-        hidden_sound = None
         if action_latents is not None:
             if action_latents.shape[0] != hidden_states.shape[0]:
                 raise ValueError(
@@ -1511,60 +1519,16 @@ class Cosmos3VFMTransformer(nn.Module):
                 )
             if action_domain_ids is None:
                 action_domain_ids = torch.zeros(action_latents.shape[0], dtype=torch.long, device=action_latents.device)
-            hidden_action = self.action_proj_in(self.pack_action(action_latents), action_domain_ids)
-            hidden_action = hidden_action + self.action_modality_embed.to(hidden_action.dtype)
-            s_action = hidden_action.shape[1]
+            action_tokens = self.pack_action(action_latents)
+            s_action = action_tokens.shape[1]
         if sound_latents is not None:
             if sound_latents.shape[0] != hidden_states.shape[0]:
                 raise ValueError(
                     "Cosmos3 sound and video batch sizes must match: "
                     f"video={hidden_states.shape[0]}, sound={sound_latents.shape[0]}."
                 )
-            hidden_sound = self.audio_proj_in(self.pack_sound(sound_latents))
-            hidden_sound = hidden_sound + self.audio_modality_embed.to(hidden_sound.dtype)
-            s_sound = hidden_sound.shape[1]
-
-        # Timestep embedding (fp32 for precision).
-        # For I2V: only add to noisy tokens, not conditioned ones.
-        # Conditioned frames are clean context and should not receive
-        # the diffusion timestep signal.
-        with torch.autocast(current_omni_platform.device_type, enabled=False):
-            time_embed = self.time_embedder((timestep * self.timestep_scale).float())
-        time_embed = time_embed.to(hidden_states.dtype)
-
-        if noisy_frame_mask is not None:
-            # Build per-token mask from per-frame mask.
-            # noisy_frame_mask: [B, 1, t, 1, 1] → token mask: [B, t*hp*wp, 1]
-            token_noisy_mask = (
-                noisy_frame_mask[:, 0, :, 0, 0]  # [B, t]
-                .unsqueeze(-1)  # [B, t, 1]
-                .expand(-1, -1, hp * wp)  # [B, t, hp*wp]
-                .reshape(hidden_video.shape[0], -1, 1)  # [B, t*hp*wp, 1]
-            )
-            hidden_video = hidden_video + time_embed.unsqueeze(1) * token_noisy_mask
-        else:
-            hidden_video = hidden_video + time_embed.unsqueeze(1)
-
-        if hidden_action is not None:
-            if action_noisy_mask is None:
-                hidden_action = hidden_action + time_embed.unsqueeze(1)
-            else:
-                if action_noisy_mask.shape != (hidden_action.shape[0], hidden_action.shape[1], 1):
-                    raise ValueError(
-                        "Cosmos3 action_noisy_mask must have shape [B, T_action, 1], "
-                        f"got {tuple(action_noisy_mask.shape)}."
-                    )
-                action_noisy_mask = action_noisy_mask.to(dtype=hidden_action.dtype, device=hidden_action.device)
-                hidden_action = hidden_action + time_embed.unsqueeze(1) * action_noisy_mask
-
-        if hidden_sound is not None:
-            hidden_sound = hidden_sound + time_embed.unsqueeze(1)
-        hidden_parts = [*hidden_controls, hidden_video]
-        if hidden_action is not None:
-            hidden_parts.append(hidden_action)
-        if hidden_sound is not None:
-            hidden_parts.append(hidden_sound)
-        hidden_gen = torch.cat(hidden_parts, dim=1)
+            sound_tokens = self.pack_sound(sound_latents)
+            s_sound = sound_tokens.shape[1]
 
         # Run UND pathway once and cache K/V (replicated across all ranks)
         if self.cached_kv is None:
@@ -1583,90 +1547,162 @@ class Cosmos3VFMTransformer(nn.Module):
                 num_vision_items=len(control_latent_list) + 1,
                 share_vision_temporal_positions=transfer_share_vision_temporal_positions,
             )
-            cached_kv_full = self.language_model(text_ids, freqs_und)
+            with self._offload_context("reasoner"):
+                cached_kv_full = self.language_model(text_ids, freqs_und)
             self.cached_freqs_gen = freqs_gen
 
             # Trim to real text length (remove padding).  K/V stay replicated;
             # the framework Attention layer head-slices them via joint_key/value.
             self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
 
-        # Run GEN layers.  UND K/V (replicated) is passed to each layer;
-        # the Cosmos3CrossAttention forwards them as joint_key/value so the
-        # framework Attention handles the Ulysses head-slicing internally.
-        if self.cached_kv is None or self.cached_freqs_gen is None:
-            raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
-        self._validate_gen_sequence_parallel(
-            s_gen=hidden_gen.shape[1],
-            s_video=s_video,
-            s_control=s_control,
-            s_action=s_action,
-            s_sound=s_sound,
-            has_action=has_action,
-            has_sound=has_sound,
-            has_control=has_control,
-            ulysses_size=ulysses_size,
-        )
-        freqs_cos, freqs_sin = self.cached_freqs_gen
-        hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
-        freqs_gen = (freqs_cos, freqs_sin)
-
-        if len(self.gen_layers) == len(self.cached_kv):
-            for layer, (k_und, v_und) in zip(self.gen_layers, self.cached_kv, strict=True):
-                hidden_gen = layer(
-                    hidden_gen,
-                    k_und=k_und,
-                    v_und=v_und,
-                    freqs_cos=freqs_cos,
-                    freqs_sin=freqs_sin,
+        with self._offload_context("generator"):
+            # Patchify latents and project to hidden space after UND cache
+            # construction, so model-level offload does not stage GEN weights
+            # before immediately swapping to the reasoner.
+            hidden_video = self.proj_in(self.patchify(hidden_states, t, h, w))
+            s_video = hidden_video.shape[1]
+            s_control = 0
+            hidden_controls: list[torch.Tensor] = []
+            for idx, control in enumerate(control_latent_list):
+                if control.shape != hidden_states.shape:
+                    raise ValueError(
+                        "Cosmos3 transfer control latent shape must match target latent shape: "
+                        f"control[{idx}]={tuple(control.shape)}, target={tuple(hidden_states.shape)}."
+                    )
+                hidden_control = self.proj_in(
+                    self.patchify(control.to(device=hidden_states.device, dtype=hidden_states.dtype), t, h, w)
                 )
-                # Cache-dit's block wrapper may return a tuple; unwrap it.
-                if isinstance(hidden_gen, tuple):
-                    hidden_gen = hidden_gen[0]
-        else:
-            # Cache-dit patches gen_layers to a grouped wrapper.
-            for layer in self.gen_layers:
-                hidden_gen = layer(
-                    hidden_gen,
-                    cached_kv=self.cached_kv,
-                    freqs_gen=freqs_gen,
+                hidden_controls.append(hidden_control)
+                s_control += hidden_control.shape[1]
+            hidden_action = None
+            hidden_sound = None
+            if action_tokens is not None:
+                assert action_domain_ids is not None
+                hidden_action = self.action_proj_in(action_tokens, action_domain_ids)
+                hidden_action = hidden_action + self.action_modality_embed.to(hidden_action.dtype)
+            if sound_tokens is not None:
+                hidden_sound = self.audio_proj_in(sound_tokens)
+                hidden_sound = hidden_sound + self.audio_modality_embed.to(hidden_sound.dtype)
+
+            # Timestep embedding (fp32 for precision).
+            # For I2V: only add to noisy tokens, not conditioned ones.
+            # Conditioned frames are clean context and should not receive
+            # the diffusion timestep signal.
+            with torch.autocast(current_omni_platform.device_type, enabled=False):
+                time_embed = self.time_embedder((timestep * self.timestep_scale).float())
+            time_embed = time_embed.to(hidden_states.dtype)
+
+            if noisy_frame_mask is not None:
+                # Build per-token mask from per-frame mask.
+                # noisy_frame_mask: [B, 1, t, 1, 1] → token mask: [B, t*hp*wp, 1]
+                token_noisy_mask = (
+                    noisy_frame_mask[:, 0, :, 0, 0]  # [B, t]
+                    .unsqueeze(-1)  # [B, t, 1]
+                    .expand(-1, -1, hp * wp)  # [B, t, hp*wp]
+                    .reshape(hidden_video.shape[0], -1, 1)  # [B, t*hp*wp, 1]
                 )
-                if isinstance(hidden_gen, tuple):
-                    hidden_gen = hidden_gen[0]
+                hidden_video = hidden_video + time_embed.unsqueeze(1) * token_noisy_mask
+            else:
+                hidden_video = hidden_video + time_embed.unsqueeze(1)
 
-        hidden_gen = self.gen_sp_gather(hidden_gen)
+            if hidden_action is not None:
+                if action_noisy_mask is None:
+                    hidden_action = hidden_action + time_embed.unsqueeze(1)
+                else:
+                    if action_noisy_mask.shape != (hidden_action.shape[0], hidden_action.shape[1], 1):
+                        raise ValueError(
+                            "Cosmos3 action_noisy_mask must have shape [B, T_action, 1], "
+                            f"got {tuple(action_noisy_mask.shape)}."
+                        )
+                    action_noisy_mask = action_noisy_mask.to(dtype=hidden_action.dtype, device=hidden_action.device)
+                    hidden_action = hidden_action + time_embed.unsqueeze(1) * action_noisy_mask
 
-        # Final norm and project back to latent space
-        hidden_gen = self.norm_moe_gen(hidden_gen)
-        if not has_action and not has_sound and not has_control:
-            return self.unpatchify(self.proj_out(hidden_gen), t, h, w)
+            if hidden_sound is not None:
+                hidden_sound = hidden_sound + time_embed.unsqueeze(1)
+            hidden_parts = [*hidden_controls, hidden_video]
+            if hidden_action is not None:
+                hidden_parts.append(hidden_action)
+            if hidden_sound is not None:
+                hidden_parts.append(hidden_sound)
+            hidden_gen = torch.cat(hidden_parts, dim=1)
 
-        split_sizes = []
-        if has_control:
-            split_sizes.append(s_control)
-        split_sizes.append(s_video)
-        if has_action:
-            split_sizes.append(s_action)
-        if has_sound:
-            split_sizes.append(s_sound)
-        split_hidden = hidden_gen.split(split_sizes, dim=1)
-        split_idx = 0
-        if has_control:
+            # Run GEN layers.  UND K/V (replicated) is passed to each layer;
+            # the Cosmos3CrossAttention forwards them as joint_key/value so the
+            # framework Attention handles the Ulysses head-slicing internally.
+            if self.cached_kv is None or self.cached_freqs_gen is None:
+                raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
+            self._validate_gen_sequence_parallel(
+                s_gen=hidden_gen.shape[1],
+                s_video=s_video,
+                s_control=s_control,
+                s_action=s_action,
+                s_sound=s_sound,
+                has_action=has_action,
+                has_sound=has_sound,
+                has_control=has_control,
+                ulysses_size=ulysses_size,
+            )
+            freqs_cos, freqs_sin = self.cached_freqs_gen
+            hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
+            freqs_gen = (freqs_cos, freqs_sin)
+
+            if len(self.gen_layers) == len(self.cached_kv):
+                for layer, (k_und, v_und) in zip(self.gen_layers, self.cached_kv, strict=True):
+                    hidden_gen = layer(
+                        hidden_gen,
+                        k_und=k_und,
+                        v_und=v_und,
+                        freqs_cos=freqs_cos,
+                        freqs_sin=freqs_sin,
+                    )
+                    # Cache-dit's block wrapper may return a tuple; unwrap it.
+                    if isinstance(hidden_gen, tuple):
+                        hidden_gen = hidden_gen[0]
+            else:
+                # Cache-dit patches gen_layers to a grouped wrapper.
+                for layer in self.gen_layers:
+                    hidden_gen = layer(
+                        hidden_gen,
+                        cached_kv=self.cached_kv,
+                        freqs_gen=freqs_gen,
+                    )
+                    if isinstance(hidden_gen, tuple):
+                        hidden_gen = hidden_gen[0]
+
+            hidden_gen = self.gen_sp_gather(hidden_gen)
+
+            # Final norm and project back to latent space
+            hidden_gen = self.norm_moe_gen(hidden_gen)
+            if not has_action and not has_sound and not has_control:
+                return self.unpatchify(self.proj_out(hidden_gen), t, h, w)
+
+            split_sizes = []
+            if has_control:
+                split_sizes.append(s_control)
+            split_sizes.append(s_video)
+            if has_action:
+                split_sizes.append(s_action)
+            if has_sound:
+                split_sizes.append(s_sound)
+            split_hidden = hidden_gen.split(split_sizes, dim=1)
+            split_idx = 0
+            if has_control:
+                split_idx += 1
+            hidden_video = split_hidden[split_idx]
             split_idx += 1
-        hidden_video = split_hidden[split_idx]
-        split_idx += 1
-        video_pred = self.unpatchify(self.proj_out(hidden_video), t, h, w)
-        if has_control:
-            return video_pred
-        outputs: list[torch.Tensor] = [video_pred]
-        if has_action:
-            hidden_action = split_hidden[split_idx]
-            split_idx += 1
-            assert action_domain_ids is not None
-            outputs.append(self.unpack_action(self.action_proj_out(hidden_action, action_domain_ids)))
-        if has_sound:
-            hidden_sound = split_hidden[split_idx]
-            outputs.append(self.unpack_sound(self.audio_proj_out(hidden_sound)))
-        return tuple(outputs)
+            video_pred = self.unpatchify(self.proj_out(hidden_video), t, h, w)
+            if has_control:
+                return video_pred
+            outputs: list[torch.Tensor] = [video_pred]
+            if has_action:
+                hidden_action = split_hidden[split_idx]
+                split_idx += 1
+                assert action_domain_ids is not None
+                outputs.append(self.unpack_action(self.action_proj_out(hidden_action, action_domain_ids)))
+            if has_sound:
+                hidden_sound = split_hidden[split_idx]
+                outputs.append(self.unpack_sound(self.audio_proj_out(hidden_sound)))
+            return tuple(outputs)
 
     def post_load_weights(self) -> None:
         """Post-load processing: ensure correct dtypes."""

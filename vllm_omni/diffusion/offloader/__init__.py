@@ -8,6 +8,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig, OffloadStrategy
+from .group_offload import GroupOffloadManager, ModelCPUOffloadMixin
 from .layerwise_backend import LayerWiseOffloadBackend
 from .sequential_backend import (
     ModelLevelOffloadBackend,
@@ -23,6 +24,8 @@ __all__ = [
     "OffloadStrategy",
     "LayerWiseOffloadBackend",
     "ModelLevelOffloadBackend",
+    "GroupOffloadManager",
+    "ModelCPUOffloadMixin",
     "apply_sequential_offload",
     "remove_sequential_offload",
     "get_offload_backend",
