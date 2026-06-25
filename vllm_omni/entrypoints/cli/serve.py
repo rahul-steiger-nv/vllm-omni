@@ -595,7 +595,6 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable layerwise (blockwise) offloading on DiT modules.",
         )
-
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
             "--boundary-ratio",
@@ -673,6 +672,14 @@ class OmniServeCommand(CLISubcommand):
             default=7680 * 4320,  # 8K resolution
             type=int,
             help="Maximum generated image size in pixels (height * width).",
+        )
+        # Diffusion model (mainly video generation models) streaming output mode
+        omni_config_group.add_argument(
+            "--diffusion-streaming-output",
+            dest="diffusion_streaming_output",
+            action="store_true",
+            default=False,
+            help="Enable chunked streaming output for diffusion (mainly video generation) models that support it.",
         )
 
         # TTS-specific parameters
