@@ -139,6 +139,11 @@ class GroupOffloadManager:
             raise ValueError(f"Unknown offload group: {name!r} (known: {list(self.groups)})")
         if self.active_group == name:
             return
+        # Clear first so a failure mid-swap leaves no group marked resident: once
+        # the old group is offloaded below it is no longer on device, and if
+        # _load_group(name) raises a retry must not short-circuit on a stale
+        # active_group and skip reloading.
+        self.active_group = None
         for other in self.groups:
             if other != name:
                 self._offload_group(other)
