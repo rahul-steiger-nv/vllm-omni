@@ -10,7 +10,17 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.platforms import current_omni_platform
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.fixture
+def accelerator_device() -> torch.device:
+    """Provide an accelerator device, skipping when none is available."""
+    if current_omni_platform.get_device_count() == 0:
+        pytest.skip("Accelerator required for this test")
+    return current_omni_platform.get_torch_device(0)
 
 
 def _tiny_cosmos3_config(**overrides):
@@ -183,6 +193,46 @@ def test_model_cpu_offload_swaps_back_to_generator(monkeypatch: pytest.MonkeyPat
 
     model.disable_model_cpu_offload()
     assert model._offload_manager is None
+
+
+def test_model_cpu_offload_moves_reasoner_and_generator_between_cpu_and_device(
+    monkeypatch: pytest.MonkeyPatch, accelerator_device: torch.device
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
+    )
+    model.language_model.layers = nn.ModuleList([nn.Linear(2, 2)])
+    model.gen_layers = nn.ModuleList([nn.Linear(2, 2)])
+    model.to(accelerator_device)
+
+    reasoner_param = model.language_model.layers[0].weight
+    generator_param = model.gen_layers[0].weight
+
+    model.enable_model_cpu_offload(device=accelerator_device, pin_memory=False)
+
+    manager = model._offload_manager
+    assert manager is not None
+    # On enable, every group is parked on CPU until a phase activates it.
+    assert reasoner_param.device.type == "cpu"
+    assert generator_param.device.type == "cpu"
+
+    manager.activate("reasoner")
+    assert reasoner_param.device == accelerator_device
+    assert generator_param.device.type == "cpu"
+
+    manager.activate("generator")
+    assert reasoner_param.device.type == "cpu"
+    assert generator_param.device == accelerator_device
+
+    model.disable_model_cpu_offload()
+    assert model._offload_manager is None
+    # Disable restores both components onto the device.
+    assert reasoner_param.device == accelerator_device
+    assert generator_param.device == accelerator_device
 
 
 def test_forward_accepts_transfer_control_latents(monkeypatch: pytest.MonkeyPatch) -> None:
