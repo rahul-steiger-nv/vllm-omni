@@ -173,9 +173,8 @@ def test_model_cpu_offload_swaps_back_to_generator(monkeypatch: pytest.MonkeyPat
     model.gen_layers = nn.ModuleList([ToyGeneratorLayer()])
     model.enable_model_cpu_offload(device=torch.device("cpu"), pin_memory=False)
 
-    manager = model._offload_manager
-    assert manager is not None
-    assert set(manager.groups) == {"reasoner", "generator"}
+    assert model._model_cpu_offload_enabled
+    assert set(model._model_cpu_offload_components()) == {"reasoner", "generator"}
     assert model.device == torch.device("cpu")
 
     output = model(
@@ -189,10 +188,10 @@ def test_model_cpu_offload_swaps_back_to_generator(monkeypatch: pytest.MonkeyPat
 
     assert tuple(output.shape) == (1, 2, 1, 2, 2)
     # The reasoner runs once then the generator component stays resident for GEN.
-    assert manager.active_group == "generator"
+    assert model._active_model_cpu_offload_component == "generator"
 
     model.disable_model_cpu_offload()
-    assert model._offload_manager is None
+    assert not model._model_cpu_offload_enabled
 
 
 def test_model_cpu_offload_moves_reasoner_and_generator_between_cpu_and_device(
@@ -214,22 +213,21 @@ def test_model_cpu_offload_moves_reasoner_and_generator_between_cpu_and_device(
 
     model.enable_model_cpu_offload(device=accelerator_device, pin_memory=False)
 
-    manager = model._offload_manager
-    assert manager is not None
+    assert model._model_cpu_offload_enabled
     # On enable, every group is parked on CPU until a phase activates it.
     assert reasoner_param.device.type == "cpu"
     assert generator_param.device.type == "cpu"
 
-    manager.activate("reasoner")
+    model._activate_model_cpu_offload_component("reasoner")
     assert reasoner_param.device == accelerator_device
     assert generator_param.device.type == "cpu"
 
-    manager.activate("generator")
+    model._activate_model_cpu_offload_component("generator")
     assert reasoner_param.device.type == "cpu"
     assert generator_param.device == accelerator_device
 
     model.disable_model_cpu_offload()
-    assert model._offload_manager is None
+    assert not model._model_cpu_offload_enabled
     # Disable restores both components onto the device.
     assert reasoner_param.device == accelerator_device
     assert generator_param.device == accelerator_device

@@ -89,21 +89,11 @@ in different phases of a single forward pass rather than as separate pipeline
 components -- e.g. Cosmos3's understanding (reasoner) component runs once per
 generation while the generation (generator) component runs every denoising step.
 Such models have no separate text encoder to swap against, so the transformer
-mixes in `ModelCPUOffloadMixin`, declares only its mutually-exclusive components
-via `_offload_group_specs`, and wraps each phase with
-`with self._offload_context(name):`:
+owns a small model-local offload path and wraps each phase with
+`with self._offload_context(name):`
 
 ```python
-from vllm_omni.diffusion.offloader import ModelCPUOffloadMixin
-
-class Cosmos3VFMTransformer(ModelCPUOffloadMixin, nn.Module):
-    # Map a component name to the submodule paths it owns. Everything else
-    # (embeddings, projections, norms) is inferred as GPU-resident.
-    _offload_group_specs = {
-        "reasoner": ["language_model.layers"],
-        "generator": ["gen_layers"],
-    }
-
+class Cosmos3VFMTransformer(nn.Module):
     def forward(self, ...):
         with self._offload_context("reasoner"):
             ...  # understanding pass, runs once
@@ -112,13 +102,11 @@ class Cosmos3VFMTransformer(ModelCPUOffloadMixin, nn.Module):
 ```
 
 Model-level offloading then keeps exactly one component GPU-resident at a time
-(the other on CPU), reusing the same `SequentialOffloadHook` `.to()` movers. Any
-weight not claimed by a group stays resident, so models never enumerate resident
-submodules. The pipeline opts in by exposing `enable_omni_model_cpu_offload`
-(which drives the transformer's `enable_model_cpu_offload` and pins the VAE).
-This machinery is general purpose: a future split model only declares its groups
-and wraps its forward phases. Layerwise offloading works for these models too --
-each component declares its own block container via `_layerwise_offload_blocks_attrs`.
+(the other on CPU), reusing the same `SequentialOffloadHook` `.to()` movers. The
+pipeline opts in by exposing `enable_omni_model_cpu_offload` (which drives the
+transformer's `enable_model_cpu_offload` and pins the VAE). Layerwise offloading
+works for these models too -- each component declares its own block container via
+`_layerwise_offload_blocks_attrs`.
 
 
 ## Layerwise (Blockwise) Offloading
@@ -227,8 +215,8 @@ Factory function `get_offload_backend()` selects the appropriate backend based o
 configuration.
 
 For split models, `ModelLevelOffloadBackend.enable()` detects a pipeline's
-`enable_omni_model_cpu_offload` hook and delegates to it; the model then drives a
-`GroupOffloadManager` (via `ModelCPUOffloadMixin`) to swap its components in-forward.
+`enable_omni_model_cpu_offload` hook and delegates to it; Cosmos3 then swaps its
+reasoner/generator components inside the model forward pass.
 
 
 ## Supported Models

@@ -12,7 +12,9 @@ Ported from the TRT-LLM integration (tekit branch user/shreyasm/cosmos3).
 from __future__ import annotations
 
 import math
-from typing import Any
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
@@ -36,8 +38,10 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.norm import RMSNorm as _VllmRMSNorm
-from vllm_omni.diffusion.offloader.group_offload import ModelCPUOffloadMixin
 from vllm_omni.platforms import current_omni_platform
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
 
 logger = init_logger(__name__)
 
@@ -955,7 +959,7 @@ class Cosmos3GenSPPrepare(nn.Module):
         return hidden_gen, freqs_cos, freqs_sin
 
 
-class Cosmos3VFMTransformer(ModelCPUOffloadMixin, nn.Module):
+class Cosmos3VFMTransformer(nn.Module):
     """Cosmos3 VFM Transformer: UND language model + GEN denoising layers.
 
     The UND pathway runs once per generation (K/V cached). The GEN pathway
@@ -966,25 +970,15 @@ class Cosmos3VFMTransformer(ModelCPUOffloadMixin, nn.Module):
     nested UND language model declares its own ``layers`` container so the two
     pathways are offloaded as independent rings.
 
-    Model-level CPU offload reuses :class:`ModelCPUOffloadMixin`: the UND
-    ``reasoner`` and GEN ``generator`` components are declared as mutually
-    exclusive offload groups (see ``_offload_group_specs``), and the forward
-    wraps each phase in ``with self._offload_context(...)``.
+    Model-level CPU offload is Cosmos3-local: the UND ``reasoner`` and GEN
+    ``generator`` components are swapped at the phase boundaries marked by
+    ``with self._offload_context(...)``.
 
     Sequence parallelism uses ``_sp_plan`` to shard/gather the GEN pathway at
     module boundaries. ``Cosmos3CrossAttention`` checks
     ``forward_context.sp_active`` at runtime and routes to the framework
     ``Attention`` layer (with Ulysses all-to-all) or plain SDPA accordingly.
     """
-
-    # Mutually-exclusive in-forward offload pathways: the understanding (UND)
-    # language model and the generation (GEN) denoising layers.  Everything else
-    # (embeddings, projections, norms, time/SP helpers) is inferred as resident
-    # by the manager, so no resident list is enumerated here.
-    _offload_group_specs = {
-        "reasoner": ["language_model.layers"],
-        "generator": ["gen_layers"],
-    }
 
     _cache_dit_adapter_config = CacheDiTAdapterConfig(
         # Cosmos3 GEN blocks return only hidden_states.  Per-layer UND K/V
@@ -1167,10 +1161,124 @@ class Cosmos3VFMTransformer(ModelCPUOffloadMixin, nn.Module):
         self.cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
         self.cached_freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None
 
-    # Reasoner/generator component-level CPU offload is provided by
-    # ModelCPUOffloadMixin via the ``_offload_group_specs`` declaration above;
-    # ``enable_model_cpu_offload``, ``disable_model_cpu_offload``,
-    # ``_offload_context`` and the ``device`` override are inherited from the mixin.
+        self._model_cpu_offload_enabled = False
+        self._model_cpu_offload_device: torch.device | None = None
+        self._model_cpu_offload_mover: SequentialOffloadHook | None = None
+        self._active_model_cpu_offload_component: str | None = None
+
+    @property
+    def device(self) -> torch.device:
+        offload_device = getattr(self, "_model_cpu_offload_device", None)
+        if getattr(self, "_model_cpu_offload_enabled", False) and offload_device is not None:
+            return offload_device
+        return next(self.parameters()).device
+
+    def _model_cpu_offload_components(self) -> dict[str, list[nn.Module]]:
+        """Cosmos3's mutually-exclusive reasoner/generator component sets."""
+        return {
+            "reasoner": [self.language_model.layers],
+            "generator": [self.gen_layers],
+        }
+
+    def _model_cpu_offload_component_tensor_ids(self) -> set[int]:
+        component_tensors: set[int] = set()
+        for modules in self._model_cpu_offload_components().values():
+            for module in modules:
+                component_tensors.update(id(param) for param in module.parameters())
+                component_tensors.update(id(buffer) for buffer in module.buffers())
+        return component_tensors
+
+    def _move_model_cpu_offload_residents(self) -> None:
+        """Keep non-reasoner/non-generator weights resident on the target device."""
+        component_tensors = self._model_cpu_offload_component_tensor_ids()
+        device = self._model_cpu_offload_device
+        if device is None:
+            return
+        with torch.no_grad():
+            for param in self.parameters():
+                if id(param) not in component_tensors and param.data.device != device:
+                    param.data = param.data.to(device, non_blocking=False)
+            for buffer in self.buffers():
+                if id(buffer) not in component_tensors and buffer.device != device:
+                    buffer.data = buffer.data.to(device, non_blocking=False)
+
+    def _offload_model_cpu_component(self, name: str) -> None:
+        mover = self._model_cpu_offload_mover
+        if mover is None:
+            raise RuntimeError("Cosmos3 model CPU offload is not enabled")
+        for module in self._model_cpu_offload_components()[name]:
+            mover._to_cpu(module)
+
+    def _load_model_cpu_component(self, name: str) -> None:
+        mover = self._model_cpu_offload_mover
+        if mover is None:
+            raise RuntimeError("Cosmos3 model CPU offload is not enabled")
+        for module in self._model_cpu_offload_components()[name]:
+            mover._to_gpu(module)
+
+    def enable_model_cpu_offload(
+        self,
+        *,
+        device: torch.device,
+        pin_memory: bool = True,
+        use_hsdp: bool = False,
+    ) -> None:
+        """Enable Cosmos3 reasoner/generator CPU swapping inside ``forward``."""
+        if getattr(self, "_model_cpu_offload_enabled", False):
+            return
+
+        from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
+
+        self._model_cpu_offload_device = torch.device(device)
+        self._model_cpu_offload_mover = SequentialOffloadHook(
+            offload_targets=[],
+            device=self._model_cpu_offload_device,
+            pin_memory=pin_memory,
+            use_hsdp=use_hsdp,
+        )
+        self._move_model_cpu_offload_residents()
+        for name in self._model_cpu_offload_components():
+            self._offload_model_cpu_component(name)
+        self._model_cpu_offload_enabled = True
+        self._active_model_cpu_offload_component = None
+        logger.info("Cosmos3 component-level CPU offload enabled on %s", self._model_cpu_offload_device)
+
+    def disable_model_cpu_offload(self) -> None:
+        if not getattr(self, "_model_cpu_offload_enabled", False):
+            return
+        for name in self._model_cpu_offload_components():
+            self._load_model_cpu_component(name)
+        if self._model_cpu_offload_device is not None and self._model_cpu_offload_device.type != "cpu":
+            current_omni_platform.synchronize()
+        self._model_cpu_offload_enabled = False
+        self._model_cpu_offload_device = None
+        self._model_cpu_offload_mover = None
+        self._active_model_cpu_offload_component = None
+
+    def _activate_model_cpu_offload_component(self, name: str) -> None:
+        if not getattr(self, "_model_cpu_offload_enabled", False):
+            return
+        components = self._model_cpu_offload_components()
+        if name not in components:
+            raise ValueError(f"Unknown Cosmos3 offload component: {name!r} (known: {list(components)})")
+        if self._active_model_cpu_offload_component == name:
+            return
+        self._active_model_cpu_offload_component = None
+        for other in components:
+            if other != name:
+                self._offload_model_cpu_component(other)
+        self._load_model_cpu_component(name)
+        self._active_model_cpu_offload_component = name
+
+    @contextmanager
+    def _model_cpu_offload_context(self, name: str) -> Iterator[None]:
+        self._activate_model_cpu_offload_component(name)
+        yield
+
+    def _offload_context(self, name: str) -> AbstractContextManager[None]:
+        if not getattr(self, "_model_cpu_offload_enabled", False):
+            return nullcontext()
+        return self._model_cpu_offload_context(name)
 
     # -- Patchify / Unpatchify -----------------------------------------------
 
