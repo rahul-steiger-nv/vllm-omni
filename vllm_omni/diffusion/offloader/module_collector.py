@@ -38,9 +38,7 @@ class PipelineModules:
         outer_names: list[str] = []
         outer_modules: list[nn.Module] = []
         for name, dit in zip(self.dit_names, self.dits):
-            nested = any(
-                other is not dit and any(module is dit for module in other.modules()) for other in self.dits
-            )
+            nested = any(other is not dit and any(module is dit for module in other.modules()) for other in self.dits)
             if not nested:
                 outer_names.append(name)
                 outer_modules.append(dit)
