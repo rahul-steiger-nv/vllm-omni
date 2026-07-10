@@ -207,6 +207,10 @@ class ModelLevelOffloadBackend(OffloadBackend):
         # Pipelines with a nested transformer (e.g. Cosmos3's reasoner/generator
         # pathways) own their own mutual-exclusion swaps and cannot be offloaded
         # with the generic encoder<->DiT hooks. Delegate to the custom hook.
+        # TODO: Cosmos3 is the only implementer today, so we duck-type the
+        # enable/disable_omni_model_cpu_offload pair via getattr. Once a second
+        # pipeline needs it, formalize this as a Protocol (like
+        # SupportsComponentDiscovery) instead of getattr detection.
         custom_enable = getattr(pipeline, "enable_omni_model_cpu_offload", None)
         if callable(custom_enable):
             custom_enable(
