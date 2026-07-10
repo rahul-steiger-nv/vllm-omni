@@ -35,13 +35,23 @@ class PipelineModules:
         outermost DiTs leaves the ancestor's conditions as the single source of
         truth for every nested block. Order follows ``dit_names``.
         """
+
+        def is_nested_in_another_dit(dit: nn.Module) -> bool:
+            for other in self.dits:
+                if other is dit:
+                    continue
+                for submodule in other.modules():
+                    if submodule is dit:
+                        return True
+            return False
+
         outer_names: list[str] = []
         outer_modules: list[nn.Module] = []
         for name, dit in zip(self.dit_names, self.dits):
-            nested = any(other is not dit and any(module is dit for module in other.modules()) for other in self.dits)
-            if not nested:
-                outer_names.append(name)
-                outer_modules.append(dit)
+            if is_nested_in_another_dit(dit):
+                continue
+            outer_names.append(name)
+            outer_modules.append(dit)
         return outer_names, outer_modules
 
 
