@@ -1073,6 +1073,7 @@ def calculate_metrics(
         "duration": total_duration,
         "completed_requests": num_success,
         "failed_requests": len(error_outputs),
+        "request_latencies": latencies,
         "throughput_qps": num_success / total_duration if total_duration > 0 else 0,
         "latency_mean": np.mean(latencies) if latencies else 0,
         "latency_median": np.median(latencies) if latencies else 0,

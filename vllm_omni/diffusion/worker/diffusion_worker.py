@@ -134,6 +134,62 @@ def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[No
     yield
 
 
+@contextmanager
+def _force_qutlass_nvfp4_linear_kernel(
+    quant_config: object | None,
+    additional_config: dict[str, Any] | None,
+) -> Iterator[None]:
+    from vllm_omni.quantization.qutlass_nvfp4 import (
+        QutlassNvFp4LinearKernel,
+        parse_qutlass_nvfp4_options,
+    )
+
+    options = parse_qutlass_nvfp4_options(additional_config)
+    if options is None:
+        yield
+        return
+
+    import vllm.model_executor.layers.quantization.modelopt as vllm_modelopt
+    from vllm.model_executor.kernels.linear.nvfp4.base import (
+        NvFp4LinearLayerConfig,
+    )
+
+    linear_method_cls = getattr(quant_config, "LinearMethodCls", None)
+    if linear_method_cls is not vllm_modelopt.ModelOptNvFp4LinearMethod:
+        quantization = quant_config.get_name() if hasattr(quant_config, "get_name") else None
+        raise ValueError(
+            "additional_config.qutlass_nvfp4 requires a ModelOpt NVFP4 "
+            f"diffusion stage, got {quantization!r}"
+        )
+
+    supported, reason = QutlassNvFp4LinearKernel.is_supported()
+    if not supported:
+        raise RuntimeError(f"QuTLASS NVFP4 is unavailable: {reason}")
+
+    original_init_nvfp4_linear_kernel = vllm_modelopt.init_nvfp4_linear_kernel
+
+    def init_nvfp4_linear_kernel_with_qutlass() -> QutlassNvFp4LinearKernel:
+        return QutlassNvFp4LinearKernel(
+            NvFp4LinearLayerConfig(),
+            options=options,
+        )
+
+    vllm_modelopt.init_nvfp4_linear_kernel = init_nvfp4_linear_kernel_with_qutlass
+    logger.warning(
+        "Using experimental QuTLASS NVFP4 activation quantization "
+        "(transform=%s, block_size=%d, seed=%d, fused_kernel=%s). Random-Hadamard mode is "
+        "speed-only and produces invalid outputs with unrotated checkpoint weights.",
+        options.transform,
+        options.block_size,
+        options.seed,
+        options.fused_kernel,
+    )
+    try:
+        yield
+    finally:
+        vllm_modelopt.init_nvfp4_linear_kernel = original_init_nvfp4_linear_kernel
+
+
 def _is_unexpected_additional_config_type_error(exc: TypeError) -> bool:
     """Return True only for constructor rejections of the additional_config kwarg."""
     message = str(exc)
@@ -350,10 +406,15 @@ class DiffusionWorker:
             if getattr(self.od_config, "force_cutlass_fp8", False)
             else nullcontext()
         )
+        qutlass_nvfp4_context = _force_qutlass_nvfp4_linear_kernel(
+            self.od_config.quantization_config,
+            self.od_config.additional_config,
+        )
         with (
             set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config),
             set_current_vllm_config(self.vllm_config),
             cutlass_fp8_context,
+            qutlass_nvfp4_context,
         ):
             self.model_runner.load_model(
                 memory_pool_context_fn=self._maybe_get_memory_pool_context,

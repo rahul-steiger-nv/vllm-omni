@@ -204,6 +204,57 @@ omni = Omni(
 | `--linear-backend cutlass` | str | auto | Select the validated CUTLASS linear backend for supported ModelOpt NVFP4 or mixed FP8/NVFP4 diffusion stages |
 | `--moe-backend cutlass` | str | auto | Select the validated CUTLASS MoE backend for supported ModelOpt mixed MoE checkpoints |
 
+### Experimental QuTLASS NVFP4 activation path
+
+An opt-in benchmark path replaces activation preprocessing for ModelOpt NVFP4
+diffusion linears with QuTLASS fused transform and quantization. Existing
+packed weights, weight scales, global scales, tensor-parallel behavior, and the
+CUTLASS NVFP4 GEMM are unchanged.
+
+Enable identity mode for kernel correctness checks:
+
+```bash
+vllm serve <modelopt-nvfp4-checkpoint> \
+  --omni \
+  --additional-config \
+  '{"qutlass_nvfp4":true,"qutlass_nvfp4_transform":"identity","qutlass_nvfp4_block_size":16,"qutlass_nvfp4_seed":0}'
+```
+
+Use `qutlass_nvfp4_transform=random_hadamard` only for activation-path timing.
+The checkpoint weights are not rotated, so random-Hadamard mode deliberately
+produces numerically invalid model outputs. It is not an MR-GPTQ
+implementation and must not be used for quality evaluation or production
+inference.
+
+The experimental keys are:
+
+- `qutlass_nvfp4`: enables the path; defaults to `false`.
+- `qutlass_nvfp4_transform`: `identity` or `random_hadamard`; defaults to
+  `random_hadamard`.
+- `qutlass_nvfp4_block_size`: one of `16`, `32`, `64`, or `128`; defaults to
+  `16`.
+- `qutlass_nvfp4_seed`: integer seed for the signed Hadamard transform;
+  defaults to `0`.
+- `qutlass_nvfp4_fused_kernel`: defaults to `true`. When enabled with
+  `qutlass_nvfp4_block_size=16` and a Hadamard transform on an SM100+ / CUDA
+  ≥ 12.9 GPU, activation rotation + NVFP4 quantization run through the fused
+  in-register Had16 kernel (`vllm_omni.quantization.fused_hadamard_nvfp4`) plus
+  vLLM's `cutlass_scaled_fp4_mm` — roughly pure-NVFP4 speed and 1.3–4× faster
+  than the QuTLASS `fusedQuantizeNv` path. `identity`, other block sizes, or
+  `false` fall back to QuTLASS. The fused kernel is JIT-compiled on first use
+  (needs `CUDA_HOME`, `nvcc`, and a vLLM source checkout via `VLLM_SRC_DIR`),
+  and uses the fixed normalized Sylvester Had16.
+
+Numerical correctness: these paths rotate only the activations, so a model
+whose output matches the unrotated reference needs its checkpoint weights
+rotated with the same transform at quantization time (see
+`vllm_omni.quantization.fused_hadamard_nvfp4.rotate_hadamard16`). With a
+standard unrotated ModelOpt NVFP4 checkpoint the path is speed-only.
+
+This path requires a CUDA Blackwell GPU (and, for the QuTLASS fallback, a vLLM
+build containing QuTLASS). It fails explicitly when those requirements are not
+met or when the selected diffusion stage is not ModelOpt NVFP4.
+
 ## Validation and Notes
 
 1. Compare the ModelOpt checkpoint against the BF16 baseline with the same
