@@ -572,7 +572,7 @@ _DISPLAY_CHUNK_BYTES = 64 << 20
 
 
 def _display_chunk_frame_count(video: torch.Tensor, chunk_bytes: int | None = None) -> int:
-    """Return the number of frames whose float32 form fits the budget."""
+    """Return the max frames per slice that stay within the intermediate-byte budget (always >= 1)."""
     if video.ndim != 5:
         raise ValueError(f"Expected decoded video with shape [B, C, T, H, W], got {tuple(video.shape)}.")
     if chunk_bytes is None:
