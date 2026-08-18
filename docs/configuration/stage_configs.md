@@ -27,8 +27,10 @@ The new deploy schema lives under `vllm_omni/deploy/` and is paired with a froze
 | `data_parallel_size` | int | optional | `1` | **Pipeline-wide.** DP degree for every stage. |
 | `pipeline_parallel_size` | int | optional | `1` | **Pipeline-wide.** PP degree for every stage. |
 
-Note: for diffusion path, `distributed_executor_backend` currently defaults to
-`mp`, and `ray` / `external_launcher` are not fully supported yet.
+Note: for the diffusion path, an omitted `distributed_executor_backend` selects
+`uni` on a single GPU (in-process worker, no MessageQueue / `/dev/shm` output
+segments) and `mp` when `num_gpus > 1`. Set `mp` explicitly to keep a worker
+subprocess on one GPU. `ray` / `external_launcher` are not fully supported yet.
 
 ### Stage fields
 
