@@ -184,21 +184,27 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
         raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
 
     def _device_is_usable(self) -> bool:
-        """Whether the CUDA context survived the failure we just caught.
+        """Whether the accelerator context survived the failure we just caught.
 
         Running the worker inline means a worker fault no longer kills a
         process, so nothing else notices it. Recoverable faults (OOM, an
         invalid request) leave the context intact and must not take the
         deployment down. A sticky fault (illegal memory access, ECC error)
         poisons the context: every later launch fails, so the engine needs
-        to be restarted. ``synchronize()`` re-raises a pending sticky error.
+        to be restarted. ``synchronize()`` re-raises a pending sticky error
+        on the registered accelerator (CUDA, ROCm, NPU).
         """
-        if not torch.cuda.is_available() or not torch.cuda.is_initialized():
+        if not torch.accelerator.is_available():
+            return True
+        accelerator = torch.accelerator.current_accelerator()
+        device_mod = getattr(torch, accelerator.type, None) if accelerator is not None else None
+        is_initialized = getattr(device_mod, "is_initialized", None)
+        if callable(is_initialized) and not is_initialized():
             return True
         try:
             torch.accelerator.synchronize()
         except Exception as exc:
-            logger.error("CUDA context is unusable after a worker failure: %s", exc)
+            logger.error("Device context is unusable after a worker failure: %s", exc)
             return False
         return True
 
@@ -218,7 +224,7 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
 
         The multiproc executor fires these from its process monitor. There is
         no process to monitor here, so they are fired from ``collective_rpc``
-        instead — without them a poisoned CUDA context would leave
+        instead — without them a poisoned device context would leave
         ``check_health`` reporting healthy while every request fails.
         """
         self._failure_callbacks.append(callback)

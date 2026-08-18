@@ -3,6 +3,7 @@
 
 """Single-GPU (uniproc) diffusion executor: selection and RPC behaviour."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -171,6 +172,58 @@ def test_device_probe_is_skipped_when_cuda_was_never_initialized(executor):
 
     if not torch.cuda.is_initialized():
         assert exec_.is_dead is False
+
+
+def test_device_probe_skipped_when_accelerator_unavailable(executor, monkeypatch):
+    exec_, worker = executor
+    worker.execute_method.side_effect = RuntimeError("boom")
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
+    sync = MagicMock()
+    monkeypatch.setattr(torch.accelerator, "synchronize", sync)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        exec_.collective_rpc("some_method", unique_reply_rank=0)
+
+    sync.assert_not_called()
+    assert exec_.is_dead is False
+
+
+def test_device_probe_skipped_when_device_not_initialized(executor, monkeypatch):
+    exec_, worker = executor
+    worker.execute_method.side_effect = RuntimeError("boom")
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: True)
+    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: SimpleNamespace(type="npu"))
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(is_initialized=lambda: False), raising=False)
+    sync = MagicMock()
+    monkeypatch.setattr(torch.accelerator, "synchronize", sync)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        exec_.collective_rpc("some_method", unique_reply_rank=0)
+
+    sync.assert_not_called()
+    assert exec_.is_dead is False
+
+
+def test_device_probe_latches_sticky_fault_on_npu(executor, monkeypatch):
+    """NPU must not short-circuit the probe the way a CUDA-only guard did."""
+    exec_, worker = executor
+    worker.execute_method.side_effect = RuntimeError("boom")
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: True)
+    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: SimpleNamespace(type="npu"))
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(is_initialized=lambda: True), raising=False)
+    monkeypatch.setattr(
+        torch.accelerator,
+        "synchronize",
+        MagicMock(side_effect=RuntimeError("NPU context poisoned")),
+    )
+    died = MagicMock()
+    exec_.register_failure_callback(died)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        exec_.collective_rpc("some_method", unique_reply_rank=0)
+
+    assert exec_.is_dead is True
+    died.assert_called_once_with()
 
 
 def test_check_health_ok_then_dead(executor):
