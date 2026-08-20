@@ -197,12 +197,8 @@ async def test_sleep_memory_reclaimed_custom_pipeline():
             from vllm.device_allocator.cumem import CuMemAllocator
 
             allocator = CuMemAllocator.get_instance()
-            tracked_ptrs = {
-                ptr for ptr, data in allocator.pointer_to_data.items() if not data.is_asleep
-            }
-            tracked_before = sum(
-                allocator.pointer_to_data[ptr].handle[1] for ptr in tracked_ptrs
-            )
+            tracked_ptrs = {ptr for ptr, data in allocator.pointer_to_data.items() if not data.is_asleep}
+            tracked_before = sum(allocator.pointer_to_data[ptr].handle[1] for ptr in tracked_ptrs)
         except Exception:
             pass
 
@@ -231,8 +227,7 @@ async def test_sleep_memory_reclaimed_custom_pipeline():
                 still_awake = [
                     ptr
                     for ptr in tracked_ptrs
-                    if ptr in allocator.pointer_to_data
-                    and not allocator.pointer_to_data[ptr].is_asleep
+                    if ptr in allocator.pointer_to_data and not allocator.pointer_to_data[ptr].is_asleep
                 ]
                 assert not still_awake, (
                     f"{len(still_awake)} CuMem allocation(s) remained mapped "
