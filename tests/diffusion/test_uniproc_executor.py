@@ -235,12 +235,28 @@ def test_check_health_ok_then_dead(executor):
         exec_.check_health()
 
 
-def test_shutdown_is_idempotent_and_closes_executor(executor):
+def test_shutdown_is_idempotent_and_closes_executor(executor, monkeypatch):
     exec_, worker = executor
+    collect = MagicMock()
+    empty_cache = MagicMock()
+    monkeypatch.setattr("vllm_omni.diffusion.executor.uniproc_executor.gc.collect", collect)
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.executor.uniproc_executor.current_omni_platform.is_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.executor.uniproc_executor.current_omni_platform.empty_cache",
+        empty_cache,
+    )
+    exec_.register_failure_callback(MagicMock())
 
     exec_.shutdown()
     exec_.shutdown()
 
     worker.shutdown.assert_called_once()
+    assert exec_.driver_worker is None
+    assert exec_._failure_callbacks == []
+    collect.assert_called_once_with()
+    empty_cache.assert_called_once_with()
     with pytest.raises(RuntimeError, match="closed"):
         exec_.collective_rpc("some_method", unique_reply_rank=0)

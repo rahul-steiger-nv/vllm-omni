@@ -20,6 +20,7 @@ The multiproc executor enforces deadlines via its result-queue dequeue.
 
 from __future__ import annotations
 
+import gc
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -238,9 +239,21 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
         if self._closed:
             return
         self._closed = True
-        if self.driver_worker is not None:
+        worker = self.driver_worker
+        self.driver_worker = None
+        self._failure_callbacks.clear()
+        if worker is not None:
             try:
-                self.driver_worker.shutdown()
+                worker.shutdown()
             except Exception as exc:
                 logger.warning("Diffusion worker shutdown encountered an error: %s", exc)
-        self.driver_worker = None
+        # Unlike the multiprocess executor, tearing down an inline worker does
+        # not exit its process. Drop the final model reference and return cached
+        # allocations to the driver so a subsequent engine can use the device.
+        del worker
+        gc.collect()
+        try:
+            if current_omni_platform.is_available():
+                current_omni_platform.empty_cache()
+        except Exception as exc:
+            logger.warning("Failed to release accelerator cache during diffusion worker shutdown: %s", exc)
