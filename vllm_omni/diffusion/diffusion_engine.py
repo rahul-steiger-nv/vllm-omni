@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from __future__ import annotations
 
@@ -879,7 +879,7 @@ class DiffusionEngine:
         try:
             while True:
                 output: DiffusionOutput = await queue.get()
-                async_output_id = getattr(output, "async_output_id", None)
+                async_output_id = output.async_output_id
                 if async_output_id is not None:
                     fut = self.executor.wait_output_ready(async_output_id)
                     timeout = _async_output_timeout()
@@ -900,12 +900,11 @@ class DiffusionEngine:
                         )
                         raise
                     with self._cv:
-                        pending_outputs = getattr(self, "_unclaimed_async_outputs", None)
-                        pending_ids = pending_outputs.get(request_id) if pending_outputs is not None else None
+                        pending_ids = self._unclaimed_async_outputs.get(request_id)
                         if pending_ids is not None:
                             pending_ids.discard(async_output_id)
-                            if not pending_ids and pending_outputs is not None:
-                                pending_outputs.pop(request_id, None)
+                            if not pending_ids:
+                                self._unclaimed_async_outputs.pop(request_id, None)
                 yield output
                 if output.finished:
                     break
@@ -916,8 +915,7 @@ class DiffusionEngine:
             with self._cv:
                 if self._out_streams.get(request_id) is queue:
                     self._out_streams.pop(request_id, None)
-                pending_outputs = getattr(self, "_unclaimed_async_outputs", None)
-                abandoned_ids = pending_outputs.pop(request_id, set()) if pending_outputs is not None else set()
+                abandoned_ids = self._unclaimed_async_outputs.pop(request_id, set())
             for async_output_id in abandoned_ids:
                 self.executor.drop_output(async_output_id)
 
@@ -1270,7 +1268,7 @@ class DiffusionEngine:
             queue.put_nowait(output)
 
     def _put_output(self, request_id: str, output: DiffusionOutput) -> None:
-        async_output_id = getattr(output, "async_output_id", None)
+        async_output_id = output.async_output_id
         with self._cv:
             queue = self._out_streams.get(request_id)
             if queue is not None and async_output_id is not None:
@@ -1293,11 +1291,9 @@ class DiffusionEngine:
                     self.stop_event.set()
                 pending_streams = list(self._out_streams.values())
                 self._out_streams.clear()
-                pending_outputs = getattr(self, "_unclaimed_async_outputs", None)
-                if pending_outputs is not None:
-                    for async_output_ids in pending_outputs.values():
-                        abandoned_ids.update(async_output_ids)
-                    pending_outputs.clear()
+                for async_output_ids in self._unclaimed_async_outputs.values():
+                    abandoned_ids.update(async_output_ids)
+                self._unclaimed_async_outputs.clear()
                 self._cv.notify_all()
 
         for async_output_id in abandoned_ids:
