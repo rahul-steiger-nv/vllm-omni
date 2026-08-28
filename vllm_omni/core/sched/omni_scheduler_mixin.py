@@ -149,6 +149,9 @@ class OmniSchedulerMixin:
         adapter = getattr(self, "chunk_transfer_adapter", None)
         if adapter is not None:
             adapter.segment_finished_requests.discard(session.request_id)
+            watermark = getattr(adapter, "requests_num_chunks_sent", None)
+            if watermark is not None:
+                watermark.pop(session.external_req_id, None)
         session._output_token_ids.clear()
         session._all_token_ids.clear()
         # In-flight outputs from the previous segment were optimistically
@@ -159,7 +162,10 @@ class OmniSchedulerMixin:
         # pre-replacement frame will drain, so the counter reaches exactly
         # zero; a placeholder-based seed swallowed valid new-segment frames
         # whenever placeholder counts diverged from scheduled counts.
-        session.num_stale_output_tokens += int(getattr(session, "num_in_flight_tokens", 0) or 0)
+        # num_in_flight_tokens already includes any undrained stale share.
+        # Assign instead of accumulating so callers that fenced the same
+        # rollover before entering this helper do not count it twice.
+        session.num_stale_output_tokens = int(getattr(session, "num_in_flight_tokens", 0) or 0)
         session.num_output_placeholders = 0
         session.spec_token_ids = []
         new_prompt = update.prompt_token_ids or ()
@@ -184,6 +190,44 @@ class OmniSchedulerMixin:
             self._enqueue_waiting_request(session)
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
+
+    def _release_replaced_streaming_prompt_cache(self, session: Request) -> None:
+        """Discard cache state that belongs to a replaced prompt."""
+        # A prompt replacement is not a normal streaming extension: none of
+        # the old KV blocks or encoder state is valid for the new prompt. Use
+        # the scheduler's block-free path so an in-flight GPU step is fenced
+        # correctly before the blocks return to the pool.
+        self._free_request_blocks(session)
+        self.encoder_cache_manager.free(session)
+        getattr(self, "_inflight_prefills", set()).discard(session)
+
+    def _reset_ready_async_chunk_replacements(self) -> None:
+        """Release stale cache state after an async-chunk prompt rollover."""
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        if adapter is None:
+            return
+        replaced_ids = getattr(adapter, "replaced_streaming_prompt_ids", None)
+        ready_ids = getattr(adapter, "requests_with_ready_chunks", None)
+        if not replaced_ids or not ready_ids:
+            return
+
+        for request_id in tuple(replaced_ids & ready_ids):
+            request = self.requests.get(request_id)
+            if request is None:
+                replaced_ids.discard(request_id)
+                continue
+            # The streaming update may already have fenced this same in-flight
+            # frame. Seed idempotently so the replacement does not count it twice.
+            request.num_stale_output_tokens = int(getattr(request, "num_in_flight_tokens", 0) or 0)
+            request.num_output_placeholders = 0
+            request.spec_token_ids = []
+            self._release_replaced_streaming_prompt_cache(request)
+            watermark = getattr(adapter, "requests_num_chunks_sent", None)
+            if watermark is not None:
+                watermark.pop(request.external_req_id, None)
+            # Consume this marker after the one-time cache reset. The separate
+            # ready-chunk marker remains until scheduler admission succeeds.
+            replaced_ids.discard(request_id)
 
     def _consume_pending_connector_output(self, model_mode: str) -> None:
         """Drain ``self._latest_omni_connector_output`` into the coordinator.
@@ -216,6 +260,7 @@ class OmniSchedulerMixin:
                 self.running,
                 scheduler_requests=self.requests,
             )
+            self._reset_ready_async_chunk_replacements()
             self._process_pending_chunk_timeouts()
             self._log_failed_chunk_sends()
 
@@ -427,6 +472,7 @@ class OmniSchedulerMixin:
         stop_reason: Any = None,
         prefill_stats: Any = None,
         kv_transfer_params: Any = None,
+        ec_transfer_params: Any = None,
         routed_experts: Any = None,
         num_nans_in_logits: int = 0,
         is_segment_finished: bool | None = False,
@@ -445,6 +491,7 @@ class OmniSchedulerMixin:
             events=request.take_events(),
             prefill_stats=prefill_stats,
             kv_transfer_params=kv_transfer_params,
+            ec_transfer_params=ec_transfer_params,
             trace_headers=request.trace_headers,
             routed_experts=routed_experts,
             num_nans_in_logits=num_nans_in_logits,
@@ -519,8 +566,41 @@ class OmniSchedulerMixin:
         if stopped_running_reqs:
             self.running = remove_all(self.running, stopped_running_reqs)
         if stopped_preempted_reqs:
-            self.waiting.remove_requests(stopped_preempted_reqs)
-            self.skipped_waiting.remove_requests(stopped_preempted_reqs)
+            # ``_handle_stopped_request`` re-enqueues a resumable segment as
+            # WAITING_FOR_STREAMING_REQ before this cleanup runs.  A
+            # downstream async-chunk request can have entered the update with
+            # the older WAITING_FOR_CHUNK status, which puts it in
+            # ``stopped_preempted_reqs``; deleting it here would immediately
+            # undo the requeue and the receiver would never poll chunk 1.
+            removable = {
+                request
+                for request in stopped_preempted_reqs
+                if not (
+                    request.resumable
+                    and request.status
+                    in (
+                        RequestStatus.WAITING,
+                        RequestStatus.WAITING_FOR_STREAMING_REQ,
+                    )
+                )
+            }
+            self.waiting.remove_requests(removable)
+            self.skipped_waiting.remove_requests(removable)
+
+    def _resume_downstream_chunk_receiver(self, request: Request) -> None:
+        """Resume duplex connector polling without an external update."""
+        adapter = self.chunk_transfer_adapter
+        adapter.segment_finished_requests.discard(request.request_id)
+        if (
+            not adapter.receives_chunks
+            or getattr(self.vllm_config.model_config, "session_mode", "turn") != "duplex"
+            or request.status != RequestStatus.WAITING_FOR_STREAMING_REQ
+        ):
+            return
+        self.num_waiting_for_streaming_input -= 1
+        request.status = RequestStatus.WAITING
+        self.skipped_waiting.remove_requests((request,))
+        self._enqueue_waiting_request(request)
 
     def _aggregate_kv_connector_stats(
         self,
@@ -591,8 +671,8 @@ class OmniSchedulerMixin:
             )
         }
 
-        if self.chunk_transfer_adapter:
-            self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
+        if chunk_transfer_adapter := getattr(self, "chunk_transfer_adapter", None):
+            chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
 
         self._realign_request_status_to_queues(
             request_ids,
