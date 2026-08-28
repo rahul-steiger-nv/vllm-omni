@@ -899,12 +899,13 @@ class DiffusionEngine:
                             describe(async_output_id) if describe else "unavailable",
                         )
                         raise
-                    with self._cv:
-                        pending_ids = self._unclaimed_async_outputs.get(request_id)
-                        if pending_ids is not None:
-                            pending_ids.discard(async_output_id)
-                            if not pending_ids:
-                                self._unclaimed_async_outputs.pop(request_id, None)
+                    finally:
+                        with self._cv:
+                            pending_ids = self._unclaimed_async_outputs.get(request_id)
+                            if pending_ids is not None:
+                                pending_ids.discard(async_output_id)
+                                if not pending_ids:
+                                    self._unclaimed_async_outputs.pop(request_id, None)
                 yield output
                 if output.finished:
                     break
@@ -919,9 +920,16 @@ class DiffusionEngine:
             for async_output_id in abandoned_ids:
                 self.executor.drop_output(async_output_id)
 
-    def async_add_req_and_stream_response(self, request: OmniDiffusionRequest) -> AsyncGenerator[DiffusionOutput, None]:
+    async def async_add_req_and_stream_response(
+        self, request: OmniDiffusionRequest
+    ) -> AsyncGenerator[DiffusionOutput, None]:
         request_id = self.add_request(request)
-        return self.get_output_stream(request_id)
+        stream = self.get_output_stream(request_id)
+        try:
+            async for output in stream:
+                yield output
+        finally:
+            await stream.aclose()
 
     async def async_add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         """Deprecated compatibility wrapper over ``async_add_req_and_stream_response()``.
