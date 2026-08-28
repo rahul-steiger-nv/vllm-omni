@@ -14,6 +14,7 @@ from vllm_omni.diffusion import diffusion_engine as diffusion_engine_module
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import DiffusionRequestStatus, RequestScheduler
 from vllm_omni.diffusion.worker.utils import RunnerOutput
@@ -53,6 +54,15 @@ def _make_engine() -> DiffusionEngine:
     return engine
 
 
+def _make_output_executor() -> MultiprocDiffusionExecutor:
+    executor = MultiprocDiffusionExecutor.__new__(MultiprocDiffusionExecutor)
+    executor._futures_lock = threading.RLock()
+    executor._output_futures = {}
+    executor._completed_outputs = {}
+    executor._closed = False
+    return executor
+
+
 def test_close_completes_pending_output_streams() -> None:
     engine = _make_engine()
     event_loop = asyncio.new_event_loop()
@@ -76,6 +86,18 @@ def test_put_output_discards_async_output_when_stream_is_missing() -> None:
     engine._put_output("abandoned", DiffusionOutput(async_output_id="aid-missing"))
 
     engine.executor.drop_output.assert_called_once_with("aid-missing")
+
+
+@pytest.mark.asyncio
+async def test_unstarted_stream_does_not_admit_request() -> None:
+    engine = _make_engine()
+    request = _make_request("unstarted")
+
+    stream = engine.async_add_req_and_stream_response(request)
+    await stream.aclose()
+
+    assert engine.scheduler.get_request_state(request.request_id) is None
+    assert request.request_id not in engine._out_streams
 
 
 @pytest.mark.asyncio
@@ -118,6 +140,33 @@ async def test_async_output_is_claimed_after_materialization() -> None:
 
     await stream.aclose()
     engine.executor.drop_output.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_exceptional_materialization_retires_async_output() -> None:
+    engine = _make_engine()
+    executor = _make_output_executor()
+    engine.executor = executor
+    request_id = "failed"
+    async_output_id = "aid-failed"
+    output_queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+    output_queue.put_nowait(DiffusionOutput(async_output_id=async_output_id))
+    engine._out_streams[request_id] = output_queue
+    engine._unclaimed_async_outputs[request_id] = {async_output_id}
+    stream = engine.get_output_stream(request_id)
+    next_output = asyncio.create_task(anext(stream))
+    await asyncio.sleep(0)
+
+    with executor._futures_lock:
+        ready = executor._output_futures.pop(async_output_id)
+    ready.set_exception(RuntimeError("materialization failed"))
+
+    with pytest.raises(RuntimeError, match="materialization failed"):
+        await next_output
+
+    assert executor._output_futures == {}
+    assert executor._completed_outputs == {}
+    assert request_id not in engine._unclaimed_async_outputs
 
 
 @pytest.mark.asyncio
