@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Regression tests for the busy-loop-based RPC routing in DiffusionEngine.
 
 These tests guard the invariants established when ``collective_rpc`` was
