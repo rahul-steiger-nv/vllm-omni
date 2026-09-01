@@ -1150,6 +1150,21 @@ def test_transfer_fps_matches_resolved_frame_rate_precedence() -> None:
     assert cfg.fps == sp.resolved_frame_rate == 12.0
 
 
+@pytest.mark.parametrize("use_path", [False, True], ids=["image", "path"])
+def test_transfer_pil_conversion_returns_writable_array(tmp_path, use_path: bool) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    image = Image.new("RGB", (5, 4), "red")
+    value = image
+    if use_path:
+        value = tmp_path / "control.png"
+        image.save(value)
+
+    array = transfer._pil_to_uint8_rgb(value)
+
+    assert array.flags.writeable
+
+
 def test_transfer_edge_uses_rgb_canny(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.diffusion.models.cosmos3 import transfer
 
