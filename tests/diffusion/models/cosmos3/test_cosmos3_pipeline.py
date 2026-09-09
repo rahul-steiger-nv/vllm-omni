@@ -1439,21 +1439,39 @@ def test_to_display_uint8_does_not_mutate_a_float32_caller_tensor() -> None:
     assert torch.equal(video, original)
 
 
-def test_postprocess_passes_display_frames_through_without_widening() -> None:
+def test_postprocess_restores_np_and_pt_output_contracts() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_post_process_func
 
     func = get_cosmos3_post_process_func(SimpleNamespace())
     frames = torch.arange(1 * 5 * 8 * 6 * 3, dtype=torch.uint8).reshape(1, 5, 8, 6, 3)
+    expected = frames.float() / 255.0
 
     processed = func({"video": frames})
 
     assert isinstance(processed, np.ndarray)
-    assert processed.dtype == np.uint8
-    assert np.array_equal(processed, frames.numpy())
-    assert func({"video": frames}, output_type="pt") is frames
+    assert processed.dtype == np.float32
+    assert processed.shape == (1, 5, 8, 6, 3)
+    np.testing.assert_array_equal(processed, expected.numpy())
+    processed_pt = func({"video": frames}, output_type="pt")
+    assert processed_pt.dtype == torch.float32
+    assert processed_pt.shape == (1, 5, 3, 8, 6)
+    torch.testing.assert_close(processed_pt, expected.permute(0, 1, 4, 2, 3))
+
+
+def test_postprocess_converts_display_frames_directly_to_pil() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_post_process_func
+
+    func = get_cosmos3_post_process_func(SimpleNamespace())
+    frames = torch.arange(1 * 2 * 8 * 6 * 3, dtype=torch.uint8).reshape(1, 2, 8, 6, 3)
+
     pil_frames = func({"video": frames}, output_type="pil")
+
     assert isinstance(pil_frames, list)
+    assert len(pil_frames) == 1
+    assert len(pil_frames[0]) == 2
     assert isinstance(pil_frames[0][0], Image.Image)
+    assert np.array_equal(np.asarray(pil_frames[0][0]), frames[0, 0].numpy())
+    assert np.array_equal(np.asarray(pil_frames[0][1]), frames[0, 1].numpy())
     with pytest.raises(ValueError, match="Unsupported Cosmos3 video output_type"):
         func({"video": frames}, output_type="jpeg")
 
@@ -1469,7 +1487,8 @@ def test_postprocess_moves_small_display_frames_to_cpu_for_numpy() -> None:
     processed = func({"video": frames})
 
     assert isinstance(processed, np.ndarray)
-    assert np.array_equal(processed, frames.cpu().numpy())
+    assert processed.dtype == np.float32
+    np.testing.assert_array_equal(processed, frames.cpu().float().numpy() / 255.0)
 
 
 def test_video_narrowing_preserves_cpu_offload_headroom() -> None:

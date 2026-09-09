@@ -703,6 +703,15 @@ def _should_narrow_video_output(
     return is_output_rank and not is_t2i and not enable_cpu_offload
 
 
+def _display_uint8_to_pil(video: torch.Tensor) -> list[list[PIL.Image.Image]]:
+    """Convert ``[B, T, H, W, C]`` display bytes to PIL one frame at a time."""
+    if video.ndim != 5 or video.shape[-1] not in (1, 3, 4):
+        raise ValueError(
+            f"Expected display video with shape [B, T, H, W, C] and 1, 3, or 4 channels, got {tuple(video.shape)}."
+        )
+    return [[PIL.Image.fromarray(frame.detach().cpu().numpy()) for frame in sample] for sample in video]
+
+
 def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
     """Build the postprocessor for Cosmos3 image, video, and video+audio output.
 
@@ -825,15 +834,15 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
         if guardrails_enabled:
             video = check_video_safety(video)
         if video.dtype == torch.uint8:
-            # Display-ready output intentionally remains uint8 for ``np`` and
-            # ``pt`` so serving does not widen it only to encode it as bytes.
+            # The uint8 channel-last representation is an internal transport
+            # optimization. Restore the public VideoProcessor contracts here.
             if output_type == "pt":
-                processed_video = video
+                processed_video = video.permute(0, 1, 4, 2, 3).float().div_(255.0)
             elif output_type == "np":
-                processed_video = video.detach().cpu().numpy()
+                processed_video = video.detach().cpu().numpy().astype(np.float32)
+                processed_video /= 255.0
             elif output_type == "pil":
-                vae_video = video.detach().cpu().permute(0, 4, 1, 2, 3).float().div_(127.5).sub_(1.0)
-                processed_video = video_processor.postprocess_video(vae_video, output_type="pil")
+                processed_video = _display_uint8_to_pil(video)
             else:
                 raise ValueError(f"Unsupported Cosmos3 video output_type: {output_type!r}.")
         else:
