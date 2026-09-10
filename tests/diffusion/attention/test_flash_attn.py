@@ -424,6 +424,34 @@ def test_varlen_masked_routing_by_role(monkeypatch):
     assert cu_seqlens_k.tolist() == [0, 2, 5]
 
 
+def test_published_noop_mask_uses_dense_path(monkeypatch):
+    calls = []
+
+    def fake_dense_func(q, k, v, **_kwargs):
+        calls.append("dense")
+        return q
+
+    def fail_varlen(*_args, **_kwargs):
+        raise AssertionError("published no-op mask must not use varlen attention")
+
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "IS_FLASH_ATTN_4", False)
+    monkeypatch.setattr(fa, "flash_attn_func", fake_dense_func)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fail_varlen)
+
+    impl = FlashAttentionImpl(num_heads=2, head_size=8, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 4, 2, 8)
+    metadata = AttentionMetadata(
+        attn_mask=torch.ones((1, 4), dtype=torch.bool),
+        extra={"attention_mask_mode": "none"},
+    )
+
+    output = impl.forward_cuda(query, query, query, metadata)
+
+    assert torch.equal(output, query)
+    assert calls == ["dense"]
+
+
 def test_piecewise_flash_attn_uses_varlen_fallback(monkeypatch):
     calls = []
 

@@ -18,6 +18,12 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+from vllm_omni.diffusion.attention.capabilities import (
+    ExecutionContext,
+    ExecutionPathResult,
+    OuterBoundary,
+    ParallelStrategy,
+)
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
@@ -110,6 +116,8 @@ class Attention(nn.Module):
 
         config = get_current_diffusion_config_or_none()
         attention_config = config.diffusion_attention_config if config is not None else None
+        parallel_config = getattr(config, "parallel_config", None)
+        self._hsdp_compile_boundary_enabled = bool(getattr(parallel_config, "use_hsdp", False))
 
         from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
@@ -157,7 +165,6 @@ class Attention(nn.Module):
                     attn_backend_cls.get_name(),
                     dense_backend_name,
                 )
-            parallel_config = getattr(config, "parallel_config", None)
             allgather_degree = getattr(parallel_config, "allgather_degree", 1)
             # TODO: Move AllGather-KV compatibility into an AttentionBackend capability
             # so validation does not depend on backend names.
@@ -348,16 +355,66 @@ class Attention(nn.Module):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        if torch.compiler.is_compiling() and is_forward_context_available():
-            od_config = get_forward_context().omni_diffusion_config
-            parallel_config = getattr(od_config, "parallel_config", None)
-            if getattr(parallel_config, "use_hsdp", False):
-                # Keep HSDP/FSDP2 parameter all-gather outside Inductor's
-                # attention graph; otherwise scheduler dependency analysis can
-                # fail on the fused attention region.
-                return self._forward_hsdp_compile_boundary(query, key, value, attn_metadata)
+        if torch.compiler.is_compiling() and self._uses_hsdp_compile_boundary():
+            # Keep HSDP/FSDP2 parameter all-gather outside Inductor's
+            # attention graph; otherwise scheduler dependency analysis can
+            # fail on the fused attention region.
+            return self._forward_hsdp_compile_boundary(query, key, value, attn_metadata)
 
         return self._forward_impl(query, key, value, attn_metadata)
+
+    def _uses_hsdp_compile_boundary(self) -> bool:
+        if self._hsdp_compile_boundary_enabled:
+            return True
+        if not is_forward_context_available():
+            return False
+        od_config = get_forward_context().omni_diffusion_config
+        parallel_config = getattr(od_config, "parallel_config", None)
+        return bool(getattr(parallel_config, "use_hsdp", False))
+
+    def resolve_execution_path(
+        self,
+        context: ExecutionContext,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+    ) -> ExecutionPathResult:
+        """Compose backend capabilities with outer Attention boundaries."""
+        boundaries = set(context.outer_boundaries)
+        if self._uses_hsdp_compile_boundary():
+            boundaries.add(OuterBoundary.HSDP)
+        active_strategy = self._get_active_parallel_strategy()
+        strategy_name = active_strategy.name
+        if self.use_ring and active_strategy.enabled and strategy_name == "ulysses":
+            parallel_strategy = ParallelStrategy.HYBRID_ULYSSES_RING
+        elif self.use_ring and active_strategy.enabled:
+            parallel_strategy = ParallelStrategy.RING
+        else:
+            parallel_strategy = {
+                "allgather_kv": ParallelStrategy.ALLGATHER_KV,
+                "ulysses": ParallelStrategy.ULYSSES,
+            }.get(strategy_name, ParallelStrategy.NONE)
+        resolved_context = replace(
+            context,
+            backend_explicit=self.backend_explicit,
+            outer_boundaries=frozenset(boundaries),
+            paged_kv=self.is_paged_kv_active(),
+            parallel_strategy=parallel_strategy,
+        )
+        resolver = getattr(self.attention, "resolve_execution_path", None)
+        if not callable(resolver):
+            return ExecutionPathResult.unmigrated(
+                type(self.attention).__name__,
+                resolved_context,
+            )
+        return resolver(
+            resolved_context,
+            query,
+            key,
+            value,
+            attn_metadata,
+        )
 
     @torch.compiler.disable
     def _forward_hsdp_compile_boundary(
