@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Hashable
 from dataclasses import dataclass
 from enum import Enum
 
@@ -45,31 +44,6 @@ class OuterBoundary(str, Enum):
     HSDP = "hsdp"
 
 
-class StateOwnership(str, Enum):
-    STATELESS = "stateless"
-    PROCESS = "process"
-    DEVICE = "device"
-    INSTANCE = "instance"
-
-
-class SemanticGuarantee(str, Enum):
-    CAUSALITY = "causality"
-    DTYPE = "dtype"
-    KV_BLOCK_STRIDE = "kv_block_stride"
-    MASK = "mask"
-    OUTPUT_BUFFER = "output_buffer"
-    PACKED_BOUNDARIES = "packed_boundaries"
-    PAGED_KV = "paged_kv"
-    PIECEWISE = "piecewise"
-    PREFIX_KV_SLICING = "prefix_kv_slicing"
-
-
-class FallbackPolicy(str, Enum):
-    AUTO_ONLY = "auto_only"
-    EXPLICIT_ALLOWED = "explicit_allowed"
-    NEVER = "never"
-
-
 @dataclass(frozen=True, slots=True)
 class CapabilityResult:
     status: SupportStatus
@@ -100,39 +74,12 @@ class ExecutionContext:
     causal: bool | None = None
     mask_mode: MaskMode = MaskMode.NONE
     packing_mode: PackingMode = PackingMode.NONE
-    packed_contract_valid: bool | None = None
     piecewise: bool = False
     paged_kv: bool = False
     kv_cache_dtype: str | None = None
     parallel_strategy: ParallelStrategy = ParallelStrategy.NONE
-    backend_explicit: bool = False
     require_fullgraph: bool = False
-    shape_signature: tuple[Hashable, ...] = ()
-    metadata_revision: Hashable | None = None
-    volatile_metadata: bool = False
     outer_boundaries: frozenset[OuterBoundary] = frozenset()
-
-    def make_planning_key(
-        self,
-        *normalized_execution_fields: Hashable,
-    ) -> tuple[Hashable, ...] | None:
-        """Build a key from the normalized subset that affects execution."""
-        if self.volatile_metadata:
-            return None
-        return (
-            *normalized_execution_fields,
-            self.dtype,
-            self.shape_signature,
-            self.metadata_revision,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class FallbackDescriptor:
-    path: str
-    reason: str
-    policy: FallbackPolicy
-    guarantees: frozenset[SemanticGuarantee] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,10 +91,6 @@ class ExecutionPathResult:
     platform: str
     kernel_variant: str | None
     parallel_strategy: ParallelStrategy
-    guarantees: frozenset[SemanticGuarantee] = frozenset()
-    fallback: FallbackDescriptor | None = None
-    planning_key: tuple[Hashable, ...] | None = None
-    state_ownership: StateOwnership | None = StateOwnership.STATELESS
 
     @classmethod
     def unmigrated(
@@ -156,7 +99,6 @@ class ExecutionPathResult:
         context: ExecutionContext,
         *,
         path: str = "unmigrated",
-        guarantees: frozenset[SemanticGuarantee] = frozenset(),
     ) -> ExecutionPathResult:
         return cls(
             backend=backend,
@@ -166,9 +108,6 @@ class ExecutionPathResult:
             platform=context.platform,
             kernel_variant=context.kernel_variant,
             parallel_strategy=context.parallel_strategy,
-            guarantees=guarantees,
-            planning_key=None,
-            state_ownership=None,
         )
 
     def requested_support(self, context: ExecutionContext) -> CapabilityResult:

@@ -28,13 +28,23 @@ from vllm_omni.platforms import current_omni_platform
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cuda]
 
 
+@pytest.fixture(autouse=True)
+def isolated_compiler_cache():
+    # Each case changes kernel/configuration on the same Attention.forward code
+    # object. Keep unrelated cases from exhausting its Dynamo recompile limit;
+    # retain the cache across all shapes and replays within an individual test.
+    torch.compiler.reset()
+    yield
+    torch.compiler.reset()
+
+
 @dataclass
 class _ParallelStrategyStub:
     name: str
     enabled: bool = True
 
 
-def _make_attention_layer(monkeypatch):
+def _make_attention_layer(monkeypatch, *, head_size=64):
     from vllm_omni.diffusion.attention import layer as attention_layer
 
     monkeypatch.setattr(
@@ -47,7 +57,7 @@ def _make_attention_layer(monkeypatch):
         "build_parallel_attention_strategy",
         lambda **_kwargs: NoParallelAttention(),
     )
-    return attention_layer.Attention(num_heads=8, head_size=64, softmax_scale=0.125, causal=False)
+    return attention_layer.Attention(num_heads=8, head_size=head_size, softmax_scale=head_size**-0.5, causal=False)
 
 
 @pytest.fixture
@@ -60,13 +70,24 @@ def fake_fa4(monkeypatch, tmp_path):
         with open(marker, encoding="utf-8") as handle:
             handle.read()
 
-    def fake_attention(query, key, value, **_kwargs):
+    def fake_attention(query, key, value, **kwargs):
         cached_kernel_loader()
-        return torch.empty_like(query)
+        return (
+            torch.nn.functional.scaled_dot_product_attention(
+                query.transpose(1, 2),
+                key.transpose(1, 2),
+                value.transpose(1, 2),
+                scale=kwargs["softmax_scale"],
+                is_causal=kwargs["causal"],
+            )
+            .transpose(1, 2)
+            .contiguous()
+        )
 
     monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
     monkeypatch.setattr(fa, "IS_FLASH_ATTN_4", True)
     monkeypatch.setattr(fa, "flash_attn_func", fake_attention)
+    monkeypatch.setattr(fa, "validate_fa4_head_dims", lambda *_args: True)
 
     return FlashAttentionImpl(
         num_heads=8,
@@ -115,6 +136,8 @@ def test_fa4_dense_dispatch_is_opaque_to_dynamic_torch_compile(fake_fa4):
 
     assert out.shape == q.shape
     assert out2.shape == q2.shape
+    torch.testing.assert_close(out, impl.forward_cuda(q, q, q))
+    torch.testing.assert_close(out2, impl.forward_cuda(q2, q2, q2))
     assert compile_count == 1
 
 
@@ -148,7 +171,6 @@ def test_fa4_production_attention_entry_compiles_with_inductor(
         platform="cuda",
         kernel_variant="fa4",
         dtype="bfloat16",
-        backend_explicit=True,
         paged_kv=True,
         parallel_strategy=ParallelStrategy.ULYSSES,
         require_fullgraph=True,
@@ -156,7 +178,6 @@ def test_fa4_production_attention_entry_compiles_with_inductor(
     path = layer.resolve_execution_path(context, q, q, q, None)
     assert path.support.status is SupportStatus.SUPPORTED
     assert path.compilation_mode is CompilationMode.CUSTOM_OP
-    assert resolved_contexts[-1].backend_explicit is False
     assert resolved_contexts[-1].paged_kv is False
     assert resolved_contexts[-1].parallel_strategy is ParallelStrategy.NONE
 
@@ -164,8 +185,9 @@ def test_fa4_production_attention_entry_compiles_with_inductor(
     out = compiled(q, q, q)
 
     assert out.shape == q.shape
+    torch.testing.assert_close(out, layer(q, q, q))
     q2 = torch.randn(1, 24, 8, 64, device="cuda", dtype=torch.bfloat16)
-    assert compiled(q2, q2, q2).shape == q2.shape
+    torch.testing.assert_close(compiled(q2, q2, q2), layer(q2, q2, q2))
 
     layer.paged_kv_cache_role = "self"
     monkeypatch.setattr(layer, "_active_paged_kv_adapter", lambda: object())
@@ -205,7 +227,8 @@ def test_fa4_production_attention_entry_compiles_with_inductor(
 
 
 @hardware_test(res={"cuda": "B200"}, num_cards=1)
-def test_real_fa4_fullgraph_matches_sdpa_across_shapes(monkeypatch):
+@pytest.mark.parametrize("head_dims", [(32, 32), (64, 64), (80, 48), (192, 128), (256, 256)])
+def test_real_fa4_fullgraph_matches_sdpa_across_shapes(monkeypatch, head_dims):
     """Validate real FA4 numerics through the complete compiled attention layer."""
     capability = current_omni_platform.get_device_capability() if current_omni_platform.is_cuda() else None
     if capability is None or capability.major < 10:
@@ -215,13 +238,16 @@ def test_real_fa4_fullgraph_matches_sdpa_across_shapes(monkeypatch):
 
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
-    layer = _make_attention_layer(monkeypatch)
+    head_size, value_head_size = head_dims
+    layer = _make_attention_layer(monkeypatch, head_size=head_size)
     compiled = torch.compile(layer, fullgraph=True, dynamic=True)
     generator = torch.Generator(device="cuda").manual_seed(42)
     context = ExecutionContext(platform="cuda", require_fullgraph=True)
-    for length in (16, 24, 48):
+    # Tile boundaries, cross-attention lengths, batching, and a longer sequence.
+    for batch, q_length, kv_length in ((1, 16, 16), (1, 129, 257), (2, 257, 129), (1, 1024, 1024)):
         query, key, value = (
-            torch.randn(1, length, 8, 64, device="cuda", dtype=torch.bfloat16, generator=generator) for _ in range(3)
+            torch.randn(batch, length, 8, dim, device="cuda", dtype=torch.bfloat16, generator=generator)
+            for length, dim in ((q_length, head_size), (kv_length, head_size), (kv_length, value_head_size))
         )
         path = layer.resolve_execution_path(context, query, key, value, None)
         assert path.requested_support(context).status is SupportStatus.SUPPORTED
@@ -230,9 +256,41 @@ def test_real_fa4_fullgraph_matches_sdpa_across_shapes(monkeypatch):
                 query.transpose(1, 2).float(),
                 key.transpose(1, 2).float(),
                 value.transpose(1, 2).float(),
-                scale=0.125,
+                scale=head_size**-0.5,
             ).transpose(1, 2)
         actual = compiled(query, key, value)
         assert actual.dtype == query.dtype
         assert actual.device == query.device
         torch.testing.assert_close(actual.float(), reference, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(actual, layer(query, key, value))
+
+
+@hardware_test(res={"cuda": "B200"}, num_cards=1)
+@pytest.mark.parametrize("head_dims", [(192, 192), (65, 64), (64, 65)])
+def test_real_fa4_dimension_rejection_matches_kernel(monkeypatch, head_dims):
+    capability = current_omni_platform.get_device_capability() if current_omni_platform.is_cuda() else None
+    if capability is None or capability.major not in (10, 11) or not fa.IS_FLASH_ATTN_4:
+        pytest.skip("Requires SM100/SM110 CuTe FlashAttention-4")
+    head_size, value_head_size = head_dims
+    layer = _make_attention_layer(monkeypatch, head_size=head_size)
+    query = torch.randn(1, 16, 8, head_size, device="cuda", dtype=torch.bfloat16)
+    value = torch.randn(1, 16, 8, value_head_size, device="cuda", dtype=torch.bfloat16)
+    context = ExecutionContext(platform="cuda", require_fullgraph=True)
+    path = layer.resolve_execution_path(context, query, query, value, None)
+    assert path.requested_support(context).status is SupportStatus.UNSUPPORTED
+    with pytest.raises(AssertionError) as error:
+        layer(query, query, value)
+    assert str(error.value) in path.support.reason
+
+
+@hardware_test(res={"cuda": "B200"}, num_cards=1)
+def test_real_fa4_custom_op_unequal_value_dimension_schema():
+    if not current_omni_platform.is_cuda() or not fa.IS_FLASH_ATTN_4:
+        pytest.skip("Requires CuTe FlashAttention-4")
+    query = torch.randn(1, 17, 8, 80, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(1, 25, 8, 80, device="cuda", dtype=torch.bfloat16)
+    value = torch.randn(1, 25, 8, 48, device="cuda", dtype=torch.bfloat16)
+    torch.library.opcheck(
+        torch.ops.vllm_omni.fa4_dense_attention.default,
+        (query, key, value, 80**-0.5, False, False),
+    )

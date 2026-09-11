@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -16,17 +19,26 @@ from vllm_omni.diffusion.attention.backends.flash_attn import (
     FlashAttentionBackend,
     FlashAttentionImpl,
 )
+from vllm_omni.diffusion.attention.backends.utils import fa
 from vllm_omni.diffusion.attention.capabilities import (
     CapabilityResult,
     CompilationMode,
     ExecutionContext,
     OuterBoundary,
     ParallelStrategy,
-    StateOwnership,
     SupportStatus,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+_validate_fa4_head_dims = fa.validate_fa4_head_dims
+
+
+@pytest.fixture(autouse=True)
+def kernel_validator(monkeypatch):
+    # Capability unit tests do not require FA4 or a CUDA device. Real-kernel
+    # validation is exercised by test_flash_attn_compile.py.
+    monkeypatch.setattr(fa, "validate_fa4_head_dims", lambda *_args: True)
 
 
 def _impl(*, kernel_variant: str | None = "fa4", causal: bool = False):
@@ -110,18 +122,6 @@ def test_request_preserves_verified_rejection_reason():
     assert result.requested_support(ExecutionContext(platform="cuda", require_fullgraph=True)) == result.support
 
 
-def test_planning_key_uses_normalized_fields_and_metadata_revision():
-    first = ExecutionContext(
-        platform="cuda",
-        shape_signature=(1, 16, 8, 64),
-        metadata_revision=1,
-    )
-    changed = replace(first, metadata_revision=2)
-
-    assert first.make_planning_key("cuda", "fa4", "fa4_dense") != changed.make_planning_key("cuda", "fa4", "fa4_dense")
-    assert replace(first, volatile_metadata=True).make_planning_key("cuda", "fa4", "fa4_dense") is None
-
-
 def test_exact_cuda_fa4_dense_path_is_supported():
     context = ExecutionContext(
         platform="cuda",
@@ -132,15 +132,70 @@ def test_exact_cuda_fa4_dense_path_is_supported():
     assert result.path == "fa4_dense"
     assert result.support.status is SupportStatus.SUPPORTED
     assert result.compilation_mode is CompilationMode.CUSTOM_OP
-    assert result.state_ownership is StateOwnership.STATELESS
     assert result.requested_support(context).status is SupportStatus.SUPPORTED
-    assert result.planning_key is not None
 
 
 def test_causal_fa4_path_remains_unmigrated():
     result = _resolve(_impl(causal=True))
 
     assert result.support.status is SupportStatus.UNMIGRATED
+
+
+def test_fa4_delegates_dimensions_to_kernel(monkeypatch):
+    head_dims = (80, 48)
+    validator = Mock(return_value=True)
+    monkeypatch.setattr(fa, "validate_fa4_head_dims", validator)
+    query = torch.empty((1, 16, 8, head_dims[0]), dtype=torch.bfloat16)
+    value = torch.empty((1, 16, 8, head_dims[1]), dtype=torch.bfloat16)
+    result = _impl().resolve_execution_path(ExecutionContext(platform="cuda"), query, query, value, None)
+    assert result.support.status is SupportStatus.SUPPORTED
+    validator.assert_called_once_with(*head_dims, 8)
+
+
+def test_fa4_reports_kernel_rejection(monkeypatch):
+    monkeypatch.setattr(fa, "validate_fa4_head_dims", Mock(side_effect=AssertionError("kernel dimension constraint")))
+    result = _resolve(_impl())
+    assert result.support.status is SupportStatus.UNSUPPORTED
+    assert "kernel dimension constraint" in result.support.reason
+    assert "another backend" in result.support.reason
+
+
+def test_fa4_missing_validator_remains_unmigrated(monkeypatch):
+    monkeypatch.setattr(fa, "validate_fa4_head_dims", lambda *_args: False)
+    result = _resolve(_impl())
+    assert result.support.status is SupportStatus.UNMIGRATED
+    assert result.compilation_mode is CompilationMode.EAGER_ONLY
+
+
+def test_fa4_rejects_mismatched_query_key_dimensions():
+    query = torch.empty((1, 16, 8, 64), dtype=torch.bfloat16)
+    key = torch.empty((1, 16, 8, 32), dtype=torch.bfloat16)
+    result = _impl().resolve_execution_path(ExecutionContext(platform="cuda"), query, key, key, None)
+    assert result.support.status is SupportStatus.UNSUPPORTED
+    assert "Q and K head dimensions must match" in result.support.reason
+
+
+@pytest.mark.parametrize("arch", [90, 100, 120])
+def test_fa4_validator_adapter_uses_selected_architecture(monkeypatch, arch):
+    validator = Mock()
+    monkeypatch.setitem(
+        sys.modules,
+        "flash_attn.cute.interface",
+        SimpleNamespace(_get_device_arch=lambda: arch, _validate_head_dims=validator),
+    )
+    # Call the real adapter, not the fixture's stand-in.
+    verified = _validate_fa4_head_dims(80, 48, 8)
+    if arch == 120:
+        assert not verified
+        validator.assert_not_called()
+    else:
+        assert verified
+        validator.assert_called_once_with(80, 48, arch // 10, 8)
+
+
+def test_fa4_validator_adapter_handles_missing_private_api(monkeypatch):
+    monkeypatch.setitem(sys.modules, "flash_attn.cute.interface", SimpleNamespace())
+    assert not _validate_fa4_head_dims(64, 64, 8)
 
 
 def test_initialized_kernel_identity_overrides_caller_claim():
@@ -181,7 +236,6 @@ def test_unverified_flash_attention_variants_remain_unmigrated(changes):
 
     assert result.support.status is SupportStatus.UNMIGRATED
     assert result.compilation_mode is CompilationMode.EAGER_ONLY
-    assert result.state_ownership is None
 
 
 def test_unverified_dtype_remains_unmigrated():
@@ -239,13 +293,12 @@ def test_fixed_shape_mask_semantic_change_invalidates_dense_resolution():
     )
     impl = _impl()
     dense = _resolve(impl, attn_metadata=metadata)
-    assert dense.planning_key is not None
+    assert dense.support.status is SupportStatus.SUPPORTED
 
     metadata.attn_mask[:, 8:] = False
     metadata.extra["attention_mask_mode"] = "padding"
     masked = _resolve(impl, attn_metadata=metadata)
     assert masked.support.status is SupportStatus.UNMIGRATED
-    assert masked.planning_key is None
     request = ExecutionContext(platform="cuda", require_fullgraph=True)
     assert masked.requested_support(request).status is SupportStatus.UNSUPPORTED
 

@@ -8,6 +8,7 @@
 
 
 from dataclasses import replace
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -16,8 +17,8 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
-from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
+from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 from vllm_omni.diffusion.attention.capabilities import (
     ExecutionContext,
     ExecutionPathResult,
@@ -130,6 +131,9 @@ class Attention(nn.Module):
             is DiffusionKVCacheMode.PAGED_SCHEDULER
         )
         self._scheduler_paged_kv = scheduler_paged_kv
+        self.attn_backend: type[AttentionBackend] | None
+        self.attention: AttentionImpl | nn.Module
+        self.sdpa_fallback: SDPAImpl | None
         if custom_attention is None:
             attn_backend_cls, spec = get_attn_backend_for_role(
                 role=role,
@@ -266,6 +270,7 @@ class Attention(nn.Module):
 
         if self.paged_kv_cache_role is None:
             return None
+        assert self.attn_backend is not None  # Custom attention cannot opt into paged KV.
         dtype = self.paged_kv_cache_dtype or vllm_config.model_config.dtype
         # Keep backend layout discovery under the same config context used by
         # upstream vLLM's attention-spec collector.
@@ -298,6 +303,7 @@ class Attention(nn.Module):
     def _init_kv_cache_quantization(self, config) -> None:
         if config is None or self._has_custom_attention:
             return
+        assert self.attn_backend is not None
         dtype = getattr(config, "diffusion_kv_cache_dtype", None)
         if dtype == "auto":
             dtype = None
@@ -397,7 +403,6 @@ class Attention(nn.Module):
             }.get(strategy_name, ParallelStrategy.NONE)
         resolved_context = replace(
             context,
-            backend_explicit=self.backend_explicit,
             outer_boundaries=frozenset(boundaries),
             paged_kv=self.is_paged_kv_active(),
             parallel_strategy=parallel_strategy,
@@ -449,9 +454,11 @@ class Attention(nn.Module):
             )
         use_paged_attention = paged_adapter is not None and self.paged_kv_cache_role is not None
         if use_paged_attention and not getattr(self.attn_backend, "supports_paged_kv", False):
+            backend_name = (
+                self.attn_backend.get_name() if self.attn_backend is not None else type(self.attention).__name__
+            )
             raise NotImplementedError(
-                f"Diffusion paged KV requires an Omni backend with paged support; "
-                f"selected {self.attn_backend.get_name()}"
+                f"Diffusion paged KV requires an Omni backend with paged support; selected {backend_name}"
             )
         if use_paged_attention and strategy is not self._no_parallel_strategy:
             strategy_name = strategy.name
@@ -545,7 +552,7 @@ class Attention(nn.Module):
 
     def _run_local_attention(self, query, key, value, attn_metadata):
         if self._has_custom_attention:
-            return self.attention(query, key, value, attn_metadata)
+            return cast(nn.Module, self.attention)(query, key, value, attn_metadata)
 
         self._assert_metadata_compatible(attn_metadata)
 
@@ -560,9 +567,11 @@ class Attention(nn.Module):
             self._scheduler_paged_kv
             and self.paged_kv_cache_role is not None
             and in_kv_memory_profile
+            and self.attn_backend is not None
             and self.attn_backend.get_name() == "FLASH_ATTN"
             and not current_omni_platform.supports_diffusion_dense_flash_attention()
         ):
+            assert self.sdpa_fallback is not None
             logger.warning_once(
                 "The startup KV memory profile is using SDPA because dense FLASH_ATTN is unavailable. "
                 "Formal paged requests still use the platform-native paged attention backend."

@@ -23,8 +23,7 @@ from vllm_omni.diffusion.attention.capabilities import (
     MaskMode,
     PackingMode,
     ParallelStrategy,
-    SemanticGuarantee,
-    StateOwnership,
+    SupportStatus,
 )
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.platforms import current_omni_platform
@@ -65,18 +64,11 @@ if not hasattr(torch.ops.vllm_omni, "fa4_dense_attention"):
         causal,
         deterministic,
     ):
-        return torch.empty_like(query)
+        return query.new_empty((*query.shape[:-1], value.shape[-1]))
 
 
 _fa4_dense_attention_op = torch.ops.vllm_omni.fa4_dense_attention
 
-
-_BASE_GUARANTEES = frozenset(
-    {
-        SemanticGuarantee.CAUSALITY,
-        SemanticGuarantee.DTYPE,
-    }
-)
 
 _PACKED_KEYS = ("cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k")
 
@@ -87,7 +79,6 @@ class _FlashAttentionMetadataPlan(NamedTuple):
     full_attn_spans: list[list[tuple[int, int]]] | None
     extra: dict
     packing_mode: PackingMode
-    volatile: bool
 
 
 def _normalize_flash_attention_metadata(
@@ -124,7 +115,6 @@ def _normalize_flash_attention_metadata(
         full_attn_spans=full_attn_spans,
         extra=extra,
         packing_mode=packing_mode,
-        volatile=bool(mask_mode is not MaskMode.NONE or present_packed_keys or full_attn_spans is not None),
     )
 
 
@@ -164,21 +154,6 @@ def _flash_attention_execution_path(
         platform=context.platform,
         kernel_variant=context.kernel_variant,
         parallel_strategy=context.parallel_strategy,
-        guarantees=_BASE_GUARANTEES,
-        planning_key=context.make_planning_key(
-            context.platform,
-            context.kernel_variant,
-            "fa4_dense",
-            context.causal,
-            context.mask_mode.value,
-            context.packing_mode.value,
-            context.piecewise,
-            context.paged_kv,
-            context.kv_cache_dtype,
-            context.parallel_strategy.value,
-            (),
-        ),
-        state_ownership=StateOwnership.STATELESS,
     )
 
 
@@ -282,7 +257,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         attn_metadata: AttentionMetadata | None,
     ) -> ExecutionPathResult:
         metadata = _normalize_flash_attention_metadata(attn_metadata)
-        return _flash_attention_execution_path(
+        result = _flash_attention_execution_path(
             replace(
                 context,
                 kernel_variant=self._kernel_variant,
@@ -292,10 +267,29 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 packing_mode=metadata.packing_mode,
                 piecewise=metadata.full_attn_spans is not None,
                 kv_cache_dtype=metadata.extra.get("kv_cache_dtype"),
-                shape_signature=(tuple(query.shape), tuple(key.shape), tuple(value.shape)),
-                volatile_metadata=context.volatile_metadata or metadata.volatile,
             )
         )
+        if result.support.status is not SupportStatus.SUPPORTED:
+            return result
+
+        from vllm_omni.diffusion.attention.backends.utils.fa import validate_fa4_head_dims
+
+        try:
+            if query.shape[-1] != key.shape[-1]:
+                raise ValueError("Q and K head dimensions must match")
+            verified = validate_fa4_head_dims(query.shape[-1], value.shape[-1], 16 // value.element_size())
+        except (AssertionError, ValueError) as error:
+            return replace(
+                result,
+                support=CapabilityResult.unsupported(f"FA4: {error} Select compatible inputs or another backend."),
+            )
+        if not verified:
+            return replace(
+                result,
+                support=CapabilityResult.unmigrated("Selected FA4 kernel has no available head-dimension validator"),
+                compilation_mode=CompilationMode.EAGER_ONLY,
+            )
+        return result
 
     def _warn_fa_deterministic_non_dense(self, path: str) -> None:
         if not self.fa_deterministic:

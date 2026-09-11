@@ -295,7 +295,7 @@ class AttentionImpl(ABC, Generic[T]):
     ) -> ExecutionPathResult:
         """Resolve the complete path after backend initialization.
 
-        Subclasses opt into enforcement by returning a verified result.
+        Subclasses report verified results; this inspection API does not enforce them.
         """
         del query, key, value, attn_metadata
         return ExecutionPathResult.unmigrated(type(self).__name__, context)
