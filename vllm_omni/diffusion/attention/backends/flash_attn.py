@@ -240,9 +240,9 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         self.softmax_scale = softmax_scale
         self.qkv_layout = qkv_layout
         self.is_cross_attn = role == "cross"
-        from vllm_omni.diffusion.attention.backends.utils.fa import IS_FLASH_ATTN_4
+        from vllm_omni.diffusion.attention.backends.utils.fa import IS_AITER, IS_FLASH_ATTN_4
 
-        self._kernel_variant = "fa4" if IS_FLASH_ATTN_4 else None
+        self._kernel_variant = "fa4" if IS_FLASH_ATTN_4 else "aiter" if IS_AITER else None
         cfg = get_current_diffusion_config_or_none()
         self.fa_deterministic = bool(getattr(cfg, "fa_deterministic", False)) if cfg is not None else False
         if backend_kwargs:
@@ -256,19 +256,22 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
     ) -> ExecutionPathResult:
+        if context.platform == "npu":
+            return self._resolve_npu_execution_path(context, query, key, attn_metadata)
         metadata = _normalize_flash_attention_metadata(attn_metadata)
-        result = _flash_attention_execution_path(
-            replace(
-                context,
-                kernel_variant=self._kernel_variant,
-                dtype=str(query.dtype).removeprefix("torch."),
-                causal=self.causal,
-                mask_mode=metadata.mask_mode,
-                packing_mode=metadata.packing_mode,
-                piecewise=metadata.full_attn_spans is not None,
-                kv_cache_dtype=metadata.extra.get("kv_cache_dtype"),
-            )
+        context = replace(
+            context,
+            kernel_variant=self._kernel_variant,
+            dtype=str(query.dtype).removeprefix("torch."),
+            causal=self.causal,
+            mask_mode=metadata.mask_mode,
+            packing_mode=metadata.packing_mode,
+            piecewise=metadata.full_attn_spans is not None,
+            kv_cache_dtype=metadata.extra.get("kv_cache_dtype"),
         )
+        if context.platform == "rocm":
+            return self._resolve_rocm_execution_path(context)
+        result = _flash_attention_execution_path(context)
         if result.support.status is not SupportStatus.SUPPORTED:
             return result
 
@@ -290,6 +293,77 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 compilation_mode=CompilationMode.EAGER_ONLY,
             )
         return result
+
+    @staticmethod
+    def _resolve_rocm_execution_path(context: ExecutionContext) -> ExecutionPathResult:
+        """Describe AITER dispatch; device and compiler validation is pending."""
+        result = ExecutionPathResult.unmigrated("FLASH_ATTN", context, path="rocm_unverified")
+        if (
+            context.kernel_variant != "aiter"
+            or context.parallel_strategy is not ParallelStrategy.NONE
+            or context.outer_boundaries
+            or context.paged_kv
+            or context.piecewise
+            or context.kv_cache_dtype is not None
+        ):
+            return result
+        if context.packing_mode is not PackingMode.NONE:
+            path = "rocm_packed_varlen"
+        elif context.mask_mode is MaskMode.UNKNOWN:
+            path = "rocm_runtime_mask_dependent"
+        elif context.mask_mode is not MaskMode.NONE:
+            path = "rocm_masked_varlen"
+        else:
+            path = "rocm_dense"
+        return replace(
+            result,
+            path=path,
+            support=CapabilityResult.unmigrated("AITER routing only; kernel and compilation validation require ROCm"),
+        )
+
+    def _resolve_npu_execution_path(
+        self,
+        context: ExecutionContext,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+    ) -> ExecutionPathResult:
+        """Describe existing MindIE routing without claiming hardware validation.
+
+        NPU packing has its own opt-in and [real, pad] contract. In particular,
+        incomplete packed metadata can fall back to a mask, so CUDA metadata
+        normalization must not run here. No tensor values are inspected.
+        """
+        context = replace(context, kernel_variant="mindiesd")
+        result = ExecutionPathResult.unmigrated("FLASH_ATTN", context, path="npu_unverified")
+        extra = attn_metadata.extra if attn_metadata else {}
+        if (
+            context.parallel_strategy is not ParallelStrategy.NONE
+            or context.outer_boundaries
+            or context.paged_kv
+            or self.causal
+            or extra.get("kv_cache_dtype") is not None
+            or (attn_metadata is not None and attn_metadata.full_attn_spans is not None)
+        ):
+            return result
+
+        path = "npu_masked" if attn_metadata is not None and attn_metadata.attn_mask is not None else "npu_dense"
+        if extra.get("npu_attn_varlen", False):
+            if self._resolve_packed_seq_npu(query, key, extra) is not None:
+                path = (
+                    "npu_prefix_kv_slice"
+                    if os.environ.get("MINDIE_SD_FA_TYPE") == "ascend_laser_attention"
+                    else "npu_packed_varlen"
+                )
+            else:
+                # This route may reject the request if neither an explicit mask
+                # nor usable valid_kv_length is supplied; it is not support.
+                path = "npu_masked_fallback"
+        return replace(
+            result,
+            path=path,
+            support=CapabilityResult.unmigrated("NPU routing only; kernel and compilation validation require Ascend"),
+        )
 
     def _warn_fa_deterministic_non_dense(self, path: str) -> None:
         if not self.fa_deterministic:
