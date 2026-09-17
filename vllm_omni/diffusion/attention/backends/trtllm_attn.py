@@ -169,9 +169,7 @@ if not hasattr(torch.ops.vllm_omni, "trtllm_ragged_attention"):
     ):
         # Match FlashInfer's default output dtype for quantized queries.
         out_dtype = (
-            torch.bfloat16
-            if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.int8)
-            else query.dtype
+            torch.bfloat16 if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.int8) else query.dtype
         )
         return torch.empty_like(query, dtype=out_dtype)
 
