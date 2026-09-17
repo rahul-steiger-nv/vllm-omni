@@ -167,7 +167,13 @@ if not hasattr(torch.ops.vllm_omni, "trtllm_ragged_attention"):
         sage_k_block_size,
         is_causal,
     ):
-        return torch.empty_like(query)
+        # Match FlashInfer's default output dtype for quantized queries.
+        out_dtype = (
+            torch.bfloat16
+            if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.int8)
+            else query.dtype
+        )
+        return torch.empty_like(query, dtype=out_dtype)
 
 
 _trtllm_ragged_attention_op = torch.ops.vllm_omni.trtllm_ragged_attention
