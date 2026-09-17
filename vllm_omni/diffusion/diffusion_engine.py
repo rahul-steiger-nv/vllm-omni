@@ -441,6 +441,7 @@ class DiffusionEngine:
         generator = self.get_output_stream(request_id)
         async for output in generator:
             exec_total_time = time.perf_counter() - exec_start_time
+            output_ready_wait_time = getattr(output, "stage_durations", {}).get("output_ready_wait", 0.0)
             postprocess_start_time = time.perf_counter()
             scheduler_metrics = diffusion_scheduler_waiting_metrics(getattr(self, "_scheduler_num_waiting_reqs", 0))
             try:
@@ -454,10 +455,11 @@ class DiffusionEngine:
             step_total_ms = (time.perf_counter() - diffusion_engine_start_time) * 1000
             logger.debug(
                 "DiffusionEngine.step_streaming breakdown: preprocess=%.2f ms, "
-                "add_req_and_wait=%.2f ms, "
+                "add_req_and_wait=%.2f ms, output_ready_wait=%.2f ms, "
                 "postprocess=%.2f ms, total=%.2f ms",
                 preprocess_time * 1000,
                 exec_total_time * 1000,
+                output_ready_wait_time * 1000,
                 postprocess_time * 1000,
                 step_total_ms,
             )
@@ -465,6 +467,7 @@ class DiffusionEngine:
                 metrics_update = {
                     "preprocess_time_ms": preprocess_time * 1000,
                     "diffusion_engine_exec_time_ms": exec_total_time * 1000,
+                    "output_ready_wait_time_ms": output_ready_wait_time * 1000,
                     "postprocess_time_ms": postprocess_time * 1000,
                     **scheduler_metrics,
                 }
@@ -896,13 +899,19 @@ class DiffusionEngine:
                 if async_output_id is not None:
                     fut = self.executor.wait_output_ready(async_output_id)
                     timeout = _async_output_timeout()
+                    output_ready_wait_start_time = time.perf_counter()
                     try:
                         output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
+                        output.stage_durations["output_ready_wait"] = time.perf_counter() - output_ready_wait_start_time
                     except asyncio.CancelledError:
-                        self.executor.drop_output(async_output_id)
+                        # Delivery already retires completed futures; dropping
+                        # them again would create an orphaned executor waiter.
+                        if not fut.done():
+                            self.executor.drop_output(async_output_id)
                         raise
                     except (TimeoutError, asyncio.TimeoutError):
-                        self.executor.drop_output(async_output_id)
+                        if not fut.done():
+                            self.executor.drop_output(async_output_id)
                         describe = getattr(self.executor, "describe_pending_state", None)
                         logger.error(
                             "Timed out after %.1fs waiting for async output; set %s to a larger value "

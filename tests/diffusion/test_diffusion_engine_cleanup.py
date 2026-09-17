@@ -5,6 +5,7 @@ import asyncio
 import concurrent.futures
 import queue
 import threading
+from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -59,6 +60,7 @@ def _make_output_executor() -> MultiprocDiffusionExecutor:
     executor._futures_lock = threading.RLock()
     executor._output_futures = {}
     executor._completed_outputs = {}
+    executor._dropped_output_ids = OrderedDict()
     executor._closed = False
     return executor
 
@@ -135,6 +137,7 @@ async def test_async_output_is_claimed_after_materialization() -> None:
     stream = engine.get_output_stream(request_id)
 
     assert await anext(stream) is materialized_output
+    assert materialized_output.stage_durations["output_ready_wait"] >= 0.0
     assert request_id not in engine._unclaimed_async_outputs
     engine.executor.wait_output_ready.assert_called_once_with("aid-claimed")
 
@@ -170,11 +173,14 @@ async def test_exceptional_materialization_retires_async_output() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cancelling_materialization_discards_async_output() -> None:
+@pytest.mark.parametrize("running", [False, True])
+async def test_cancelling_materialization_discards_async_output(running: bool) -> None:
     engine = _make_engine()
     request_id = "cancelled"
     pending_output = DiffusionOutput(async_output_id="aid-cancelled")
     ready: concurrent.futures.Future[DiffusionOutput] = concurrent.futures.Future()
+    if running:
+        ready.set_running_or_notify_cancel()
     engine.executor.wait_output_ready.return_value = ready
     output_queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
     output_queue.put_nowait(pending_output)
@@ -188,8 +194,47 @@ async def test_cancelling_materialization_discards_async_output() -> None:
     with pytest.raises(asyncio.CancelledError):
         await next_output
 
-    engine.executor.drop_output.assert_called_with("aid-cancelled")
-    assert ready.cancelled()
+    if running:
+        engine.executor.drop_output.assert_called_once_with("aid-cancelled")
+        assert not ready.done()
+    else:
+        # The cancelled waiter remains registered until the executor drains it.
+        engine.executor.drop_output.assert_not_called()
+        assert ready.cancelled()
+    assert request_id not in engine._out_streams
+    assert request_id not in engine._unclaimed_async_outputs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed", [False, True])
+async def test_cancellation_after_delivery_does_not_recreate_waiter(failed: bool) -> None:
+    engine = _make_engine()
+    executor = _make_output_executor()
+    engine.executor = executor
+    request_id = "delivered"
+    async_output_id = "aid-delivered"
+    output_queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+    output_queue.put_nowait(DiffusionOutput(async_output_id=async_output_id))
+    engine._out_streams[request_id] = output_queue
+    engine._unclaimed_async_outputs[request_id] = {async_output_id}
+    stream = engine.get_output_stream(request_id)
+    next_output = asyncio.create_task(anext(stream))
+    await asyncio.sleep(0)
+
+    # Match delivery: remove the waiter and resolve it before cancellation
+    # reaches the coroutine awaiting its wrapped future.
+    with executor._futures_lock:
+        ready = executor._output_futures.pop(async_output_id)
+    if failed:
+        ready.set_exception(RuntimeError("materialization failed"))
+    else:
+        ready.set_result(DiffusionOutput(output="materialized", finished=True))
+    next_output.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await next_output
+
+    assert executor._output_futures == {}
+    assert executor._completed_outputs == {}
     assert request_id not in engine._out_streams
     assert request_id not in engine._unclaimed_async_outputs
 
