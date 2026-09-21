@@ -48,6 +48,8 @@ Defined in `pyproject.toml`:
 | `MI325`            | Tests that require MI325 GPU (AMD/ROCm) *                                                               |
 | `A2`               | Tests that require A2 NPU *                                                                             |
 | `A3`               | Tests that require A3 NPU *                                                                             |
+| `A5`               | Tests that require A5 NPU *                                                                             |
+| `310P`             | Tests that require 310P NPU *                                                                           |
 | `cards_{n}`        | Tests that require *n* accelerator cards (`cards_1` … `cards_8`); auto-added from `num_cards` *         |
 | `slow`             | Slow tests (may skip in quick CI)                                                                       |
 | `benchmark`        | Benchmark tests (decorator on runner test functions; perf JSON uses `full_model` + type marker instead) |
@@ -76,7 +78,7 @@ def test_video_to_audio()
 This decorator is intended to make hardware-aware, cross-platform test authoring easier and more robust for CI/CD environments. The `hardware_test` decorator in `vllm-omni/tests/helpers/mark.py` performs the following actions:
 
 1. **Applies platform and resource markers**  
-   Adds the appropriate pytest markers for each specified hardware platform (e.g., `cuda`, `rocm`, `xpu`, `npu`) and resource type (e.g., `L4`, `H100`, `H200`, `B200`, `MI325`, `B60`, `A2`, `A3`).
+   Adds the appropriate pytest markers for each specified hardware platform (e.g., `cuda`, `rocm`, `xpu`, `npu`) and resource type (e.g., `L4`, `H100`, `H200`, `B200`, `MI325`, `B60`, `A2`, `A3`, `A5`, `310P`).
    ```python
    @pytest.mark.cuda
    @pytest.mark.L4
@@ -553,7 +555,7 @@ L5 level testing focuses on the performance of model services under ***long-runn
 
 - ***Trigger Timing***: **`Weekly`** (weekly) or **`Days before Release`** (several days before a major release). Due to long execution times, the frequency is lower.
 - ***Run Command***:
-    - ***Stability***: `pytest -s -v tests/dfx/stability/scripts/test_stability_qwen3_omni.py` or `pytest -s -v tests/dfx/stability/scripts/test_stability_wan22.py` (or add `test_stability_<model>.py` alongside a matching JSON config)
+    - ***Stability***: `pytest -s -v tests/dfx/stability/scripts/run_stability_qwen3_omni.py` or `pytest -s -v tests/dfx/stability/scripts/run_stability_wan22.py` (or add `run_stability_<model>.py` alongside a matching JSON config)
     - ***Reliability***: `pytest -s -v tests/dfx/reliability/test_reliability_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`).
 - ***Script Example***:
 
@@ -562,7 +564,7 @@ L5 level testing focuses on the performance of model services under ***long-runn
 
 ##### Stability
 
-When you want to add L5-level stability test cases, add or extend the appropriate JSON file under `tests/dfx/stability/tests/` (for example `test_qwen3_omni.json` for Omni bench traffic, or `test_wan22.json` for diffusion `/v1/videos` workloads). Pair the JSON with `tests/dfx/stability/scripts/test_stability_<model>.py`. The following illustrates the Qwen3-Omni shape:
+When you want to add L5-level stability test cases, add or extend the appropriate JSON file under `tests/dfx/stability/tests/` (for example `test_qwen3_omni.json` for Omni bench traffic, or `test_wan22.json` for diffusion `/v1/videos` workloads). Pair the JSON with `tests/dfx/stability/scripts/run_stability_<model>.py`. The following illustrates the Qwen3-Omni shape:
 
 ```json
 {
