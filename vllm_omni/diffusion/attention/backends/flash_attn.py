@@ -62,7 +62,8 @@ if not hasattr(torch.ops.vllm_omni, "fa4_dense_attention"):
         causal,
         deterministic,
     ):
-        return torch.empty_like(query, memory_format=torch.contiguous_format)
+        # FA4 returns contiguous output even when Q is noncontiguous; V sets its head dimension.
+        return query.new_empty((*query.shape[:-1], value.shape[-1]))
 
 
 _fa4_dense_attention_op = torch.ops.vllm_omni.fa4_dense_attention
