@@ -128,6 +128,7 @@ from vllm_omni.entrypoints.openai.images.helpers import (
     _check_max_generated_image_size,
     _choose_output_format,
     _extract_images_from_result,
+    _generated_size_str,
     _get_max_edit_input_images,
     _load_input_images,
     _update_if_not_none,
@@ -168,6 +169,7 @@ from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import (
+    LatentEditInput,
     OmniOpenAIServingVideo,
     ReferenceAudio,
     ReferenceImage,
@@ -521,7 +523,9 @@ def _should_serve_duplex(model: str, kwargs: dict[str, Any]) -> bool:
             deploy_path = _DEPLOY_DIR / deploy_path
 
     # Resolve base_config too, so the API and stage workers use the same mode.
-    session_mode = resolve_deploy_yaml(deploy_path).get("session_mode")
+    session_mode = resolve_deploy_yaml(deploy_path).get(
+        "session_mode", getattr(pipeline_config, "default_session_mode", None)
+    )
     if session_mode not in ("turn", "duplex"):
         raise ValueError("A duplex-capable model requires session_mode: turn or duplex in its deploy config")
     return session_mode == "duplex"
@@ -1459,7 +1463,6 @@ async def list_voices(raw_request: Request):
     handler = Omnispeech(raw_request)
     if handler is None:
         return _create_speech_error_json_response(
-            raw_request,
             "The model does not support Speech API",
             err_type="NotFoundError",
             status_code=HTTPStatus.NOT_FOUND,
@@ -1574,7 +1577,6 @@ async def upload_voice(
     handler = Omnispeech(raw_request)
     if handler is None:
         return _create_speech_error_json_response(
-            raw_request,
             "The model does not support Speech API",
             err_type="NotFoundError",
             status_code=HTTPStatus.NOT_FOUND,
@@ -1582,9 +1584,7 @@ async def upload_voice(
 
     try:
         if speaker_embedding is not None and audio_sample is not None:
-            return _create_speech_error_json_response(
-                raw_request, "'audio_sample' and 'speaker_embedding' are mutually exclusive"
-            )
+            return _create_speech_error_json_response("'audio_sample' and 'speaker_embedding' are mutually exclusive")
         if speaker_embedding is not None:
             result = await handler.upload_voice_embedding(speaker_embedding, consent, name)
         elif audio_sample is not None:
@@ -1596,18 +1596,15 @@ async def upload_voice(
                 speaker_description=speaker_description,
             )
         else:
-            return _create_speech_error_json_response(
-                raw_request, "Either 'audio_sample' or 'speaker_embedding' must be provided"
-            )
+            return _create_speech_error_json_response("Either 'audio_sample' or 'speaker_embedding' must be provided")
 
         return JSONResponse(content={"success": True, "voice": result})
 
     except ValueError as e:
-        return _create_speech_error_json_response(raw_request, str(e))
+        return _create_speech_error_json_response(str(e))
     except Exception as e:
         logger.exception(f"Failed to upload voice: {e}")
         return _create_speech_error_json_response(
-            raw_request,
             f"Failed to upload voice: {str(e)}",
             err_type="InternalServerError",
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -1640,7 +1637,6 @@ async def delete_voice(name: str, raw_request: Request):
     handler = Omnispeech(raw_request)
     if handler is None:
         return _create_speech_error_json_response(
-            raw_request,
             "The model does not support Speech API",
             err_type="NotFoundError",
             status_code=HTTPStatus.NOT_FOUND,
@@ -1651,7 +1647,6 @@ async def delete_voice(name: str, raw_request: Request):
         success = await handler.delete_voice(name)
         if not success:
             return _create_speech_error_json_response(
-                raw_request,
                 f"Voice '{name}' not found",
                 err_type="NotFoundError",
                 status_code=HTTPStatus.NOT_FOUND,
@@ -1660,11 +1655,10 @@ async def delete_voice(name: str, raw_request: Request):
         return JSONResponse(content={"success": True, "message": f"Voice '{name}' deleted successfully"})
 
     except ValueError as e:
-        return _create_speech_error_json_response(raw_request, str(e))
+        return _create_speech_error_json_response(str(e))
     except Exception as e:
         logger.exception(f"Failed to delete voice '{name}': {e}")
         return _create_speech_error_json_response(
-            raw_request,
             f"Failed to delete voice: {str(e)}",
             err_type="InternalServerError",
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -1740,6 +1734,12 @@ async def realtime_websocket(websocket: WebSocket):
             return
         await _wait_for_duplex_warmup(websocket)
         await duplex_handler.handle_realtime_session(websocket)
+        return
+
+    if isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"}:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "code": "unsupported", "error": "VAD realtime is not enabled"})
+        await websocket.close(code=1008)
         return
 
     serving = getattr(websocket.app.state, "openai_serving_realtime", None)
@@ -1993,8 +1993,9 @@ def _build_image_generation_response(
             peak_memory_mb=peak_memory_mb,
         ),
     }
-    if request.size is not None:
-        response_kwargs["size"] = request.size
+    size = _generated_size_str(images, request.size)
+    if size is not None:
+        response_kwargs["size"] = size
     response = ImageGenerationResponse(**response_kwargs)
     if request.response_format == ResponseFormat.FILE:
         return response.stream_response()
@@ -2042,6 +2043,8 @@ async def generate_images(
         )
 
     try:
+        width: int | None = None
+        height: int | None = None
         # Unify request construction for any multi-stage pipeline to avoid
         # divergence between /v1/images and /v1/chat/completions.
         if len(stage_configs) > 1:
@@ -2059,7 +2062,6 @@ async def generate_images(
                 "num_outputs_per_prompt": request.n,
             }
             if request.size is not None:
-                parse_size(request.size)
                 width, height = parse_size(request.size)
                 app_state_args = getattr(raw_request.app.state, "args", None)
                 _check_max_generated_image_size(app_state_args, width, height)
@@ -2113,7 +2115,7 @@ async def generate_images(
             )
 
         # Build params - pass through user values directly
-        prompt: OmniTextPrompt = {"prompt": request.prompt, "modalities": ["image"]}
+        prompt = OmniTextPrompt(prompt=request.prompt, modalities=["image"])
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
         gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
@@ -2129,12 +2131,11 @@ async def generate_images(
         if extra_args:
             gen_params.extra_args = extra_args
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
-        lora_request, lora_scale = _parse_lora_request(request.lora)
+        lora_request, lora_scale = _parse_lora_request(request.lora) if request.lora is not None else (None, None)
         _update_if_not_none(gen_params, "lora_request", lora_request)
         _update_if_not_none(gen_params, "lora_scale", lora_scale)
 
         # Parse and add size if provided
-        width, height = None, None
         if request.size:
             width, height = parse_size(request.size)
             size_str = f"{width}x{height}"
@@ -2300,9 +2301,9 @@ async def edit_images(
     try:
         # 2. Build prompt & images params
         cot_output = None
-        prompt: OmniTextPrompt = {"prompt": prompt, "modalities": ["image"]}
+        omni_prompt = OmniTextPrompt(prompt=prompt, modalities=["image"])
         if negative_prompt is not None:
-            prompt["negative_prompt"] = negative_prompt
+            omni_prompt["negative_prompt"] = negative_prompt
         input_images_list = []
         images = image or image_array
         urls = url or url_array
@@ -2333,17 +2334,17 @@ async def edit_images(
         # Hunyuan-aware behavior. RGBA/P uploads otherwise diverge from offline.
         normalize_edit_images_rgb = bot_task is not None or sys_type is not None
         pil_images = await _load_input_images(input_images_list, normalize_rgb=normalize_edit_images_rgb)
-        prompt["multi_modal_data"] = {}
-        prompt["multi_modal_data"]["image"] = pil_images
+        omni_prompt["multi_modal_data"] = {}
+        omni_prompt["multi_modal_data"]["image"] = pil_images
 
         if mask_image is not None:
             # Mask role is different (alpha channel matters); never normalize.
             loaded = await _load_input_images([mask_image], normalize_rgb=False)
-            prompt["multi_modal_data"]["mask_image"] = loaded[0]
+            omni_prompt["multi_modal_data"]["mask_image"] = loaded[0]
 
         if reference_image is not None:
             loaded = await _load_input_images([reference_image], normalize_rgb=normalize_edit_images_rgb)
-            prompt["multi_modal_data"]["reference_image"] = loaded[0]
+            omni_prompt["multi_modal_data"]["reference_image"] = loaded[0]
 
         # 3 Build sample params
         gen_params = OmniDiffusionSamplingParams()
@@ -2409,16 +2410,18 @@ async def edit_images(
         # Keep AR stage target grid in sync with requested output size.
         # GLM-Image consumes target_h/target_w via mm_processor_kwargs.
         if width is not None and height is not None:
-            prompt["mm_processor_kwargs"] = {
+            omni_prompt["mm_processor_kwargs"] = {
                 "target_h": height,
                 "target_w": width,
             }
             # Backward-compatible fallback for processors reading top-level fields.
-            prompt["height"] = height
-            prompt["width"] = width
+            omni_prompt["height"] = height
+            omni_prompt["width"] = width
 
         _update_if_not_none(gen_params, "width", width)
         _update_if_not_none(gen_params, "height", height)
+        gen_params.width_not_provided = size_was_auto
+        gen_params.height_not_provided = size_was_auto
 
         # 3.4 Add optional parameters ONLY if provided
         _update_if_not_none(gen_params, "num_inference_steps", num_inference_steps)
@@ -2513,7 +2516,7 @@ async def edit_images(
             if return_stage_metrics is not None:
                 extra_body["return_stage_metrics"] = return_stage_metrics
 
-            prompt_text = prompt.get("prompt", "")
+            prompt_text = omni_prompt.get("prompt", "")
             generation_result = await chat_handler.generate_diffusion_images(
                 prompt=prompt_text,
                 extra_body=extra_body,
@@ -2544,7 +2547,7 @@ async def edit_images(
                 engine_client=engine_client,
                 gen_params=gen_params,
                 stage_configs=stage_configs,
-                prompt=prompt,
+                prompt=omni_prompt,
                 request_id=request_id,
             )
             images = _extract_images_from_result(result)
@@ -2552,6 +2555,8 @@ async def edit_images(
             peak_memory_mb = getattr(result, "peak_memory_mb", None)
             response_metrics = getattr(result, "metrics", None) if return_stage_metrics else None
 
+        if images is None:
+            images = []
         logger.debug(f"Successfully generated {len(images)} image(s)")
 
         # Encode images to base64
@@ -2569,7 +2574,7 @@ async def edit_images(
             created=int(time.time()),
             data=image_data,
             output_format=output_format,
-            size=size_str,
+            size=_generated_size_str(images, size_str),
             cot_output=cot_output,
             metrics=_build_image_response_metrics(
                 response_metrics=response_metrics,
@@ -2613,6 +2618,7 @@ async def create_video(
         ReferenceVideo | None,
         ReferenceAudio | None,
         str | None,
+        LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> VideoResponse:
     """Create an asynchronous video generation job.
@@ -2628,6 +2634,7 @@ async def create_video(
         reference_video,
         reference_audio,
         control_path,
+        latent_edit_input,
     ) = ctx
     ref = video_response_from_request(effective_model_name, request)
     await VIDEO_STORE.upsert(ref.id, ref)
@@ -2641,6 +2648,7 @@ async def create_video(
             reference_audio,
             control_path,
             app_state=raw_request.app.state,
+            latent_edit_input=latent_edit_input,
         )
     )
     await VIDEO_TASKS.upsert(ref.id, task)
@@ -2666,6 +2674,7 @@ async def create_video_sync(
         ReferenceVideo | None,
         ReferenceAudio | None,
         str | None,
+        LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> Response:
     """Synchronous video generation endpoint.
@@ -2685,6 +2694,7 @@ async def create_video_sync(
         reference_video,
         reference_audio,
         control_path,
+        latent_edit_input,
     ) = ctx
     request_id = f"video_sync-{random_uuid()}"
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
@@ -2698,6 +2708,7 @@ async def create_video_sync(
                     reference_image=reference_image,
                     reference_video=reference_video,
                     reference_audio=reference_audio,
+                    latent_edit_input=latent_edit_input,
                 ),
                 timeout=VIDEO_SYNC_TIMEOUT_S,
             ),
@@ -2721,7 +2732,7 @@ async def create_video_sync(
             detail=f"Video generation failed: {str(exc)}",
         ) from exc
     finally:
-        _cleanup_video_references(reference_video, reference_audio, control_path)
+        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
     inference_time_s = time.perf_counter() - started_at
 
     return Response(
@@ -2973,7 +2984,10 @@ async def omni_sleep(request: OmniSleepRequest, raw_request: Request):
     acks = await engine_client.sleep(stage_ids=request.stage_ids, level=request.level)
     for sid in request.stage_ids:
         sleeping_set.add(sid)
-    return {"status": "SUCCESS", "acks": [dataclasses.asdict(a) if dataclasses.is_dataclass(a) else a for a in acks]}
+    return {
+        "status": "SUCCESS",
+        "acks": [dataclasses.asdict(a) if dataclasses.is_dataclass(a) and not isinstance(a, type) else a for a in acks],
+    }
 
 
 @router.post("/v1/omni/wakeup")
@@ -2989,7 +3003,10 @@ async def omni_wakeup(request: OmniWakeupRequest, raw_request: Request):
     for sid in request.stage_ids:
         if sid in sleeping_set:
             sleeping_set.remove(sid)
-    return {"status": "SUCCESS", "acks": [dataclasses.asdict(a) if dataclasses.is_dataclass(a) else a for a in acks]}
+    return {
+        "status": "SUCCESS",
+        "acks": [dataclasses.asdict(a) if dataclasses.is_dataclass(a) and not isinstance(a, type) else a for a in acks],
+    }
 
 
 if __name__ == "__main__":
