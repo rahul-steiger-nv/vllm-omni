@@ -870,6 +870,42 @@ async def _consume_final_output(generator):
 
 
 @pytest.mark.cpu
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_wait", [0.0, 4.0])
+async def test_step_streaming_excludes_output_wait_from_execution_time(
+    output_wait: float, mocker: MockerFixture
+) -> None:
+    clock = [0.0]
+    mocker.patch.object(diffusion_engine_module.time, "perf_counter", side_effect=lambda: clock[0])
+    stage_durations = {"output_ready_wait": output_wait} if output_wait else {}
+    output = DiffusionOutput(stage_durations=stage_durations)
+    formatted_output = SimpleNamespace(metrics={})
+    request = SimpleNamespace(scheduler_queue_wait_ms=None)
+
+    async def output_stream(request_id):
+        # Ten seconds of execution followed by output materialization.
+        clock[0] = 10.0 + output_wait
+        yield output
+
+    engine = mocker.Mock(
+        pre_process_func=None,
+        _scheduler_num_waiting_reqs=0,
+        _check_and_start_background_loop=mocker.AsyncMock(),
+        _prepare_request_for_admission=mocker.Mock(return_value=request),
+        _add_prepared_request=mocker.Mock(return_value="timed-request"),
+        get_output_stream=output_stream,
+        postprocess_output=mocker.Mock(return_value=[formatted_output]),
+    )
+
+    results = [batch async for batch in DiffusionEngine.step_streaming(engine, request)]
+
+    assert results == [[formatted_output]]
+    assert formatted_output.metrics["diffusion_engine_exec_time_ms"] == pytest.approx(10_000.0)
+    assert formatted_output.metrics["output_ready_wait_time_ms"] == pytest.approx(output_wait * 1000)
+    assert formatted_output.metrics["postprocess_time_ms"] == 0.0
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize("entrypoint", ["add_request", "async_add_req_and_stream_response"])
 @pytest.mark.asyncio
 async def test_engine_admission_preprocesses_request_once(entrypoint: str, mocker: MockerFixture) -> None:

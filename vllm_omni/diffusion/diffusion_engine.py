@@ -474,8 +474,10 @@ class DiffusionEngine:
         request_id = self._add_prepared_request(request)
         generator = self.get_output_stream(request_id)
         async for output in generator:
-            exec_total_time = time.perf_counter() - exec_start_time
             output_ready_wait_time = getattr(output, "stage_durations", {}).get("output_ready_wait", 0.0)
+            # The stream now materializes async outputs before yielding. Keep
+            # that wait separate from execution time in the timing breakdown.
+            exec_total_time = time.perf_counter() - exec_start_time - output_ready_wait_time
             postprocess_start_time = time.perf_counter()
             scheduler_metrics = diffusion_scheduler_waiting_metrics(getattr(self, "_scheduler_num_waiting_reqs", 0))
             try:
