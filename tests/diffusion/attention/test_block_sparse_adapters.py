@@ -15,7 +15,7 @@ from vllm_omni.diffusion.attention.capabilities import CompilationMode
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cuda]
 
 
-@pytest.fixture(params=["FLASH_ATTN"])
+@pytest.fixture(params=["FLASH_ATTN", "CUDNN_ATTN"])
 def sparse_adapter(request):
     # Add a provider here and its dependency/device setup below to run the same contract.
     if not torch.cuda.is_available():
@@ -24,6 +24,10 @@ def sparse_adapter(request):
         if torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3)):
             pytest.skip("Requires Hopper or datacenter Blackwell")
         pytest.importorskip("flash_attn.cute")
+    else:
+        if torch.cuda.get_device_capability() != (9, 0):
+            pytest.skip("These cuDNN BSA cases are exercised on Hopper")
+        pytest.importorskip("cudnn.block_sparse_attention")
     adapter_cls = DiffusionAttentionBackendEnum[request.param].get_class().get_block_sparse_adapter()
     assert adapter_cls is not None
     torch.compiler.reset()
@@ -47,11 +51,11 @@ def sparse_adapter(request):
 def test_selected_attention_contract(sparse_adapter, kv_heads, dtype, pattern, compile_case, value_size):
     # FA4 b33 adapts tiles to 64x64 on Hopper. Blackwell defaults to
     # tile_n=128 and two 128-row Q stages for these sequence lengths.
-    blackwell = torch.cuda.get_device_capability()[0] == 10
+    blackwell = sparse_adapter.provider == "FLASH_ATTN" and torch.cuda.get_device_capability()[0] == 10
     block_size = (256, 128) if blackwell else (64, 64)
     q, k, v = make_attention_inputs(
         kv_heads=kv_heads,
-        q_len=513 if blackwell else 129,
+        q_len=128 if sparse_adapter.provider == "CUDNN_ATTN" else (513 if blackwell else 129),
         kv_len=577 if blackwell else 193,
         value_size=value_size,
         dtype=dtype,
@@ -92,6 +96,14 @@ def test_selected_attention_contract(sparse_adapter, kv_heads, dtype, pattern, c
     torch.testing.assert_close(
         run(q, k, v, updated, scale, block_size).float(), updated_expected, atol=0.004, rtol=0.02
     )
+    if pattern == "per_row":
+        changed_indices = indices.clone()
+        changed_indices[..., 0] = 1 - indices[..., 0]
+        changed = BlockSelection(changed_indices, counts)
+        expected_changed = selected_attention_reference(q, k, v, changed, scale, block_size)
+        torch.testing.assert_close(
+            run(q, k, v, changed, scale, block_size).float(), expected_changed, atol=0.004, rtol=0.02
+        )
     torch.testing.assert_close(result, saved_result, atol=0, rtol=0)
     for original, snapshot in zip(tensors, snapshots):
         torch.testing.assert_close(original, snapshot, atol=0, rtol=0)
