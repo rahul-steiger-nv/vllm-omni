@@ -21,8 +21,8 @@ def sparse_adapter(request):
     if not torch.cuda.is_available():
         pytest.skip("Requires CUDA")
     if request.param == "FLASH_ATTN":
-        if torch.cuda.get_device_capability() != (9, 0):
-            pytest.skip("These FA4 contract cases are exercised on Hopper")
+        if torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3)):
+            pytest.skip("Requires Hopper or datacenter Blackwell")
         pytest.importorskip("flash_attn.cute")
     adapter_cls = DiffusionAttentionBackendEnum[request.param].get_class().get_block_sparse_adapter()
     assert adapter_cls is not None
@@ -42,10 +42,20 @@ def sparse_adapter(request):
         (4, torch.bfloat16, "full", False),
     ],
 )
+@pytest.mark.parametrize("value_size", [64, 128])
 @torch.inference_mode()
-def test_selected_attention_contract(sparse_adapter, kv_heads, dtype, pattern, compile_case):
-    block_size = (64, 64)
-    q, k, v = make_attention_inputs(kv_heads=kv_heads, kv_len=193, value_size=64, dtype=dtype)
+def test_selected_attention_contract(sparse_adapter, kv_heads, dtype, pattern, compile_case, value_size):
+    # FA4 b33 adapts tiles to 64x64 on Hopper. Blackwell defaults to
+    # tile_n=128 and two 128-row Q stages for these sequence lengths.
+    blackwell = torch.cuda.get_device_capability()[0] == 10
+    block_size = (256, 128) if blackwell else (64, 64)
+    q, k, v = make_attention_inputs(
+        kv_heads=kv_heads,
+        q_len=513 if blackwell else 129,
+        kv_len=577 if blackwell else 193,
+        value_size=value_size,
+        dtype=dtype,
+    )
     q, k, v = (torch.stack((t, t), dim=-1)[..., 0] for t in (q, k, v))
     scale = q.shape[-1] ** -0.5
     rows = (q.shape[0], q.shape[2], math.ceil(q.shape[1] / block_size[0]))
