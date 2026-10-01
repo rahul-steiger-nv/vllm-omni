@@ -728,28 +728,29 @@ class Cosmos3CrossAttention(nn.Module):
             self.norm_q = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.norm_k = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
+        # Attention consumes the rank-local heads produced by the TP projections.
         self.attn = FrameworkAttention(
-            num_heads=self.num_heads,
+            num_heads=self.num_heads_local,
             head_size=self.head_dim,
             causal=False,
             # Keep legacy per_role.self routing; exact roles opt into overrides.
             role="cosmos3.gen",
             role_category="self",
             softmax_scale=1.0 / (self.head_dim**0.5),
-            num_kv_heads=self.num_kv_heads,
+            num_kv_heads=self.num_kv_heads_local,
         )
         # Multi-control attention operates on one full [control_i, target]
         # sequence at a time. Keep those sequences replicated when Ulysses is
         # active; sharding the concatenated [control_1, ..., control_N, target]
         # layout would split the per-control ranges across ranks.
         self.multi_control_attn = FrameworkAttention(
-            num_heads=self.num_heads,
+            num_heads=self.num_heads_local,
             head_size=self.head_dim,
             causal=False,
             role="cosmos3.gen_multi_control",
             role_category="self",
             softmax_scale=1.0 / (self.head_dim**0.5),
-            num_kv_heads=self.num_kv_heads,
+            num_kv_heads=self.num_kv_heads_local,
             prefix=f"{prefix}.multi_control_attn",
             skip_sequence_parallel=True,
         )
