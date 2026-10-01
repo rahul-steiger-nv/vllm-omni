@@ -70,6 +70,8 @@ The selector and installed kernel must both accept the requested geometry;
 provider support is checked against the installed implementation rather than a
 copied hardware/dtype/head-size allowlist.
 
+Sparse provider selection follows the [platform selection contract](attention_backend_selection.md#registry-and-platform-boundary).
+
 `BlockSparseAttention` owns routing, validation, and request preparation.
 The first actual execution of each request signature runs and synchronizes the
 kernel before recording support. Capability queries are read-only and report

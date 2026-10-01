@@ -65,7 +65,7 @@ def _cached_get_backend_cls(
     """
     from vllm_omni.platforms import current_omni_platform
 
-    backend_cls_path = current_omni_platform.get_diffusion_attn_backend_cls(
+    backend_cls_path = current_omni_platform.resolve_diffusion_attn_backend(
         selected_backend=backend_name,
         head_size=head_size,
         allow_trtllm_default=allow_trtllm_default,
@@ -104,14 +104,15 @@ def _resolve_sparse_backend(spec: BlockSparseAttentionSpec, head_size: int):
     Do not translate dependency/initialization failures into compatibility
     rejections. Ordered provider selection is not supported by this lifecycle.
     """
-    from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+    from vllm_omni.platforms import current_omni_platform
 
-    backend_cls = DiffusionAttentionBackendEnum[spec.backend].get_class()
-    adapter_cls = backend_cls.get_block_sparse_adapter()
-    if adapter_cls is None:
-        raise ValueError(f"{spec.backend}: no adapter for the shared block selection")
-    adapter_cls.validate_selection(spec.implementation, head_size)
-    return backend_cls, spec
+    backend_cls_path = current_omni_platform.resolve_diffusion_attn_backend(
+        selected_backend=spec.backend,
+        head_size=head_size,
+        method="block_sparse",
+        implementation=spec.implementation,
+    )
+    return _load_backend_cls(backend_cls_path), spec
 
 
 def get_attn_backend_for_role(

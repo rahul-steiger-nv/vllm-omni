@@ -522,7 +522,7 @@ def test_dynamic_compilation_does_not_specialize_prepared_geometry(hopper, isola
 
     impl = make_impl()
     # Exceed Dynamo's default recompilation limit without resetting its cache.
-    inputs = [make_attention_inputs(q_len=length) for length in range(65, 77)]
+    inputs = [make_attention_inputs(q_len=65 + 64 * index, kv_len=1089 + 64 * index) for index in range(12)]
     expected = [impl.forward(*tensors) for tensors in inputs]
     counter = CompileCounterWithBackend("inductor")
     compiled = torch.compile(impl.forward, backend=counter, fullgraph=True, dynamic=True)
@@ -531,12 +531,61 @@ def test_dynamic_compilation_does_not_specialize_prepared_geometry(hopper, isola
     assert counter.frame_count == 1
     # A new geometry is prepared by the runtime handler, without graph fallback
     # or another graph. Capability queries remain read-only until that execution.
-    tensors = make_attention_inputs(q_len=77)
+    tensors = make_attention_inputs(q_len=833, kv_len=1857)
     context = ExecutionContext(platform="cuda")
     assert impl.resolve_execution_path(context, *tensors, None).support.status is SupportStatus.UNSUPPORTED
     actual = compiled(*tensors)
     assert impl.resolve_execution_path(context, *tensors, None).support.status is SupportStatus.SUPPORTED
     torch.testing.assert_close(actual, impl.forward(*tensors), atol=0, rtol=0)
+    assert counter.frame_count == 1
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("kv_heads", [1, 2, 4])
+@torch.inference_mode()
+def test_fa4_dynamic_adapter_preserves_changing_selections(hopper, isolated_compile_cache, kv_heads):
+    from torch._dynamo.testing import CompileCounterWithBackend
+
+    from vllm_omni.diffusion.attention.block_selection.abstract import BlockSelection
+
+    adapter = FlashAttentionBackend.get_block_sparse_adapter()()
+    block_size = (64, 64)
+    scale = 128**-0.5
+    adapter.prepare("auto", 128, 4, kv_heads, torch.device("cuda"), block_size)
+
+    # Scale and block geometry are fixed configuration, not dynamic inputs.
+    # Passing scale as a float argument makes Dynamo try symbolic scalar
+    # compilation before retrying with a specialized constant.
+    def execute(q, k, v, selection):
+        return adapter.execute(q, k, v, selection, 128**-0.5, (64, 64))
+
+    counter = CompileCounterWithBackend("inductor")
+    compiled = torch.compile(execute, backend=counter, fullgraph=True, dynamic=True)
+    for q_len, kv_len in ((129, 321), (257, 449), (385, 577), (129, 321)):
+        q, k, v = make_attention_inputs(kv_heads=kv_heads, q_len=q_len, kv_len=kv_len)
+        rows = (q.shape[0], q.shape[2], math.ceil(q_len / block_size[0]))
+        first = (torch.arange(math.prod(rows), device=q.device).reshape(rows) % 2).int()
+        counts = first + 1
+        # Include the partial last KV block and poison inactive storage.
+        last = torch.where(counts == 2, math.ceil(kv_len / block_size[1]) - 1, -999).int()
+        indices = torch.stack((first, last), dim=-1)
+        initial_result = None
+        for active_first in (first, 1 - first, first):
+            # Same shapes/counts, different per-batch/head/query-row selections.
+            selection = BlockSelection(torch.stack((active_first, last), dim=-1), counts)
+            expected = selected_attention_reference(q, k, v, selection, scale, block_size)
+            eager = adapter.execute(q, k, v, selection, scale, block_size)
+            actual = compiled(q, k, v, selection)
+            torch.testing.assert_close(actual.float(), expected, atol=0.004, rtol=0.02)
+            torch.testing.assert_close(actual, eager, atol=0, rtol=0)
+            assert actual.is_contiguous() and actual.dtype == q.dtype and actual.device == q.device
+            if initial_result is None:
+                initial_result = actual.clone()
+            elif torch.equal(selection.indices, indices):
+                torch.testing.assert_close(actual, initial_result, atol=0, rtol=0)
+            else:
+                assert not torch.equal(actual, initial_result)
+    # No compiler retries or recompilation across lengths and selections.
     assert counter.frame_count == 1
 
 
@@ -611,7 +660,9 @@ def test_regional_compilation_reuses_graph_across_sparse_owners(hopper, isolated
     model = torch.nn.Module()
     model._repeated_blocks = ["SparseTestBlock"]
     model.blocks = torch.nn.ModuleList(SparseTestBlock(i) for i in range(12))
-    inputs = [make_attention_inputs(q_len=length) for length in (65, 97)]
+    # Cross both Q and KV block boundaries, then revisit the first geometry.
+    inputs = [make_attention_inputs(q_len=q_len, kv_len=kv_len) for q_len, kv_len in ((65, 1089), (193, 1217))]
+    inputs.append(inputs[0])
     expected = [[block(*tensors) for block in model.blocks] for tensors in inputs]
     counter = CompileCounterWithBackend("inductor")
     # Exactly the production regional-compilation helper: separate torch.compile
