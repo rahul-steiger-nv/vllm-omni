@@ -3581,6 +3581,7 @@ def test_request_cancellation_at_prepare_and_decode_boundaries(preencode, cancel
 @torch.inference_mode()
 def test_unpadded_sage_token_refiner_preserves_legacy_dispatch(monkeypatch):
     from vllm_omni.diffusion.attention import layer as layer_mod
+    from vllm_omni.diffusion.attention import selector as selector_mod
     from vllm_omni.diffusion.attention.backends import sage_attn
     from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
     from vllm_omni.diffusion.config import set_current_diffusion_config
@@ -3599,6 +3600,14 @@ def test_unpadded_sage_token_refiner_preserves_legacy_dispatch(monkeypatch):
     monkeypatch.setattr(transformer, "QKVParallelLinear", lambda **kwargs: SimpleNamespace(num_heads=2, num_kv_heads=2))
     monkeypatch.setattr(transformer, "RowParallelLinear", lambda *args, **kwargs: nn.Identity())
     monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: NoParallelAttention())
+
+    # The kernel is mocked, so backend lookup must not depend on the host GPU
+    # or optional package availability. Keep role resolution and Sage dispatch real.
+    def resolve_backend(backend_name, head_size):
+        assert backend_name == "SAGE_ATTN" and head_size == 32
+        return sage_attn.SageAttentionBackend
+
+    monkeypatch.setattr(selector_mod, "_cached_get_backend_cls", resolve_backend)
     calls = []
 
     def sage_kernel(q, k, v, **kwargs):
