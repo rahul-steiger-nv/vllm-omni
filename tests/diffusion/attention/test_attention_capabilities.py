@@ -341,6 +341,7 @@ def test_layer_resolution_uses_effective_kv_quantization(skip_quant):
     torch.nn.Module.__init__(layer)
     layer.attention = _impl(kernel_variant=None)
     layer._hsdp_compile_boundary_enabled = False
+    layer.skip_sequence_parallel = False
     layer._no_parallel_strategy = NoParallelAttention()
     layer.parallel_strategy = layer._no_parallel_strategy
     layer.use_ring = False
