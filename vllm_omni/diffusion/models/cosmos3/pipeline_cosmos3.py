@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 text/image/video/sound/action pipeline for vllm-omni.
 
 One pipeline class serves the Cosmos3 family modes. Output modality is selected
@@ -693,14 +693,22 @@ def to_display_uint8(video: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _video_output_type(sampling_params) -> str:
+    explicit = getattr(sampling_params, "output_type", None)
+    if explicit is not None:
+        return explicit
+    return "uint8" if getattr(sampling_params, "prefer_video_uint8", False) else "np"
+
+
 def _should_narrow_video_output(
     *,
     is_output_rank: bool,
     is_t2i: bool,
     enable_cpu_offload: bool,
+    output_type: str = "np",
 ) -> bool:
-    """Narrow only when GPU post-decode headroom is expected."""
-    return is_output_rank and not is_t2i and not enable_cpu_offload
+    """Narrow only byte-consuming output with GPU post-decode headroom."""
+    return is_output_rank and not is_t2i and not enable_cpu_offload and output_type in ("pil", "uint8")
 
 
 def _display_uint8_to_pil(video: torch.Tensor) -> list[list[PIL.Image.Image]]:
@@ -748,9 +756,11 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
 
     def post_process_func(
         output: torch.Tensor | dict[str, torch.Tensor] | tuple,
-        output_type: str = "np",
+        output_type: str | None = None,
         sampling_params=None,
     ):
+        if output_type is None:
+            output_type = _video_output_type(sampling_params)
         if output_type == "latent":
             return output
 
@@ -833,7 +843,13 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
         guardrails_enabled = is_guardrails_enabled(od_config, sampling_params)
         if guardrails_enabled:
             video = check_video_safety(video)
-        if video.dtype == torch.uint8:
+        if output_type == "uint8":
+            # CPU offload leaves narrowing to postprocess. Both paths return
+            # the same display bytes in [B, T, H, W, C] for the video encoder.
+            if video.dtype != torch.uint8:
+                video = to_display_uint8(video)
+            processed_video = video.detach().cpu().numpy()
+        elif video.dtype == torch.uint8:
             # The uint8 channel-last representation is an internal transport
             # optimization. Restore the public VideoProcessor contracts here.
             if output_type == "pt":
@@ -4062,6 +4078,7 @@ class Cosmos3OmniDiffusersPipeline(
             is_output_rank=_is_rank_zero(),
             is_t2i=is_t2i,
             enable_cpu_offload=bool(getattr(self.od_config, "enable_cpu_offload", False)),
+            output_type=_video_output_type(sp),
         ):
             # T2I keeps the VAE range because its postprocess hands back PIL
             # images. CPU offload keeps conversion on the host to preserve the

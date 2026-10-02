@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -235,10 +235,10 @@ def passthrough_progress_bar(iterable):
 @pytest.fixture(autouse=True)
 def fake_cosmos3_guardrails(monkeypatch: pytest.MonkeyPatch):
     module = types.ModuleType("vllm_omni.diffusion.models.cosmos3.guardrails")
-    module.is_guardrails_enabled = lambda od_config, sampling_params=None: False
-    module.ensure_initialized = lambda od_config: None
-    module.check_text_safety = lambda text: None
-    module.check_video_safety = lambda video: video
+    monkeypatch.setattr(module, "is_guardrails_enabled", lambda od_config, sampling_params=None: False, raising=False)
+    monkeypatch.setattr(module, "ensure_initialized", lambda od_config: None, raising=False)
+    monkeypatch.setattr(module, "check_text_safety", lambda text: None, raising=False)
+    monkeypatch.setattr(module, "check_video_safety", lambda video: video, raising=False)
     monkeypatch.setitem(sys.modules, module.__name__, module)
     return module
 
@@ -284,7 +284,7 @@ def sequential_cfg_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def make_sampling_params(**overrides: Any) -> SimpleNamespace:
-    values = {
+    values: dict[str, Any] = {
         "height": None,
         "width": None,
         "num_frames": None,
@@ -717,7 +717,7 @@ def test_pipeline_resolves_scheduler_class_from_checkpoint_file(
     t_list = [1.0, 0.75, 0.5, 0.25]
     scheduler_dir = tmp_path / "scheduler"
     scheduler_dir.mkdir()
-    scheduler_config = {"_class_name": scheduler_class_name}
+    scheduler_config: dict[str, Any] = {"_class_name": scheduler_class_name}
     if expected_distilled:
         scheduler_config["fixed_step_sampler_config"] = {"sample_type": "sde", "t_list": t_list}
     (scheduler_dir / "scheduler_config.json").write_text(json.dumps(scheduler_config))
@@ -1494,10 +1494,16 @@ def test_postprocess_moves_small_display_frames_to_cpu_for_numpy() -> None:
 def test_video_narrowing_preserves_cpu_offload_headroom() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import _should_narrow_video_output
 
-    assert _should_narrow_video_output(is_output_rank=True, is_t2i=False, enable_cpu_offload=False)
-    assert not _should_narrow_video_output(is_output_rank=False, is_t2i=False, enable_cpu_offload=False)
-    assert not _should_narrow_video_output(is_output_rank=True, is_t2i=False, enable_cpu_offload=True)
-    assert not _should_narrow_video_output(is_output_rank=True, is_t2i=True, enable_cpu_offload=False)
+    assert _should_narrow_video_output(is_output_rank=True, is_t2i=False, enable_cpu_offload=False, output_type="pil")
+    assert not _should_narrow_video_output(
+        is_output_rank=False, is_t2i=False, enable_cpu_offload=False, output_type="pil"
+    )
+    assert not _should_narrow_video_output(
+        is_output_rank=True, is_t2i=False, enable_cpu_offload=True, output_type="pil"
+    )
+    assert not _should_narrow_video_output(
+        is_output_rank=True, is_t2i=True, enable_cpu_offload=False, output_type="pil"
+    )
 
 
 def test_action_postprocess_handles_robolab_policy_outputs() -> None:
@@ -1578,7 +1584,7 @@ def test_ir_op_priority_hook_preserves_platform_fields(monkeypatch: pytest.Monke
         custom_op: list[str]
 
     fake_kernel = types.ModuleType("vllm.config.kernel")
-    fake_kernel.IrOpPriorityConfig = FakeIrOpPriorityConfig
+    monkeypatch.setattr(fake_kernel, "IrOpPriorityConfig", FakeIrOpPriorityConfig, raising=False)
     monkeypatch.setitem(sys.modules, fake_kernel.__name__, fake_kernel)
 
     func = get_cosmos3_ir_op_priority_func(SimpleNamespace())
@@ -2629,7 +2635,7 @@ def test_diffuse_keeps_paired_cfg_when_cache_dit_active(make_cosmos3_pipeline) -
 
 class TestForwardRouting:
     def _install_forward_stubs(self, pipeline):
-        captured: dict[str, object] = {"diffuse_calls": [], "prepare_calls": []}
+        captured: dict[str, Any] = {"diffuse_calls": [], "prepare_calls": []}
 
         def fake_format(
             prompt,
@@ -2954,3 +2960,72 @@ class TestForwardRouting:
 
         with pytest.raises(ValueError, match=message):
             pipeline.forward(make_request_batch(prompt, sampling_params))
+
+
+@pytest.mark.parametrize("output_type", [None, "np", "pt", "pil"])
+@pytest.mark.parametrize("enable_cpu_offload", [False, True])
+def test_video_output_preserves_float_values(output_type, enable_cpu_offload):
+    from diffusers.video_processor import VideoProcessor
+
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        _should_narrow_video_output,
+        get_cosmos3_post_process_func,
+        to_display_uint8,
+    )
+
+    video = torch.linspace(-1, 1, 90).reshape(1, 3, 2, 3, 5)
+    video[..., 0, 0] = 0  # Must remain exactly 0.5 for floating outputs.
+    narrow = _should_narrow_video_output(
+        is_output_rank=True,
+        is_t2i=False,
+        enable_cpu_offload=enable_cpu_offload,
+        output_type=output_type or "np",
+    )
+    assert narrow == (output_type == "pil" and not enable_cpu_offload)
+    payload = to_display_uint8(video) if narrow else video
+    postprocess = get_cosmos3_post_process_func(SimpleNamespace())
+    actual = postprocess({"video": payload}, sampling_params=SimpleNamespace(output_type=output_type))
+    expected = VideoProcessor(vae_scale_factor=16).postprocess_video(video, output_type=output_type or "np")
+    if output_type == "pt":
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    elif output_type == "pil":
+        for actual_frame, expected_frame in zip(actual[0], expected[0]):
+            np.testing.assert_array_equal(np.asarray(actual_frame), np.asarray(expected_frame))
+    else:
+        np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("offload", [False, True])
+@pytest.mark.parametrize("output_type", [None, "np", "pt", "pil"])
+def test_encoded_video_preference_preserves_explicit_output_contract(output_type, offload):
+    from diffusers.video_processor import VideoProcessor
+
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        _should_narrow_video_output,
+        _video_output_type,
+        get_cosmos3_post_process_func,
+        to_display_uint8,
+    )
+
+    params = SimpleNamespace(output_type=output_type, prefer_video_uint8=True)
+    resolved = _video_output_type(params)
+    assert resolved == (output_type or "uint8")
+    video = torch.linspace(-1, 1, 90).reshape(1, 3, 2, 3, 5)
+    video[..., 0, 0] = 0
+    narrow = _should_narrow_video_output(
+        is_output_rank=True, is_t2i=False, enable_cpu_offload=offload, output_type=resolved
+    )
+    assert narrow == (output_type in (None, "pil") and not offload)
+    payload = to_display_uint8(video) if narrow else video
+    actual = get_cosmos3_post_process_func(SimpleNamespace())({"video": payload}, sampling_params=params)
+    reference = VideoProcessor(vae_scale_factor=16).postprocess_video(video, output_type=output_type or "np")
+    if output_type is None:
+        assert actual.dtype == np.uint8
+        np.testing.assert_array_equal(actual, np.round(reference * 255).astype(np.uint8))
+    elif output_type == "pt":
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    elif output_type == "pil":
+        for frame, expected in zip(actual[0], reference[0]):
+            np.testing.assert_array_equal(np.asarray(frame), np.asarray(expected))
+    else:
+        np.testing.assert_array_equal(actual, reference)
