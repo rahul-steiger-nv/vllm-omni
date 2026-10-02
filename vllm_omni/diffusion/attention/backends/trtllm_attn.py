@@ -15,6 +15,16 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
     PackedPaddingMetadata,
 )
+from vllm_omni.diffusion.attention.capabilities import (
+    CapabilityResult,
+    CompilationMode,
+    ExecutionContext,
+    ExecutionPathResult,
+    MaskMode,
+    PackingMode,
+    ParallelStrategy,
+)
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -172,9 +182,7 @@ if not hasattr(torch.ops.vllm_omni, "trtllm_ragged_attention"):
         out_dtype = (
             torch.bfloat16 if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.int8) else query.dtype
         )
-        return torch.empty(
-            (*query.shape[:-1], value.shape[-1]), dtype=out_dtype, device=query.device
-        )
+        return torch.empty((*query.shape[:-1], value.shape[-1]), dtype=out_dtype, device=query.device)
 
 
 _trtllm_ragged_attention_op = torch.ops.vllm_omni.trtllm_ragged_attention
@@ -248,8 +256,52 @@ def _workspace_bytes() -> int:
     return getattr(envs, "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE", 394 * 1024 * 1024)
 
 
+def _is_trtllm_blackwell_device(query: torch.Tensor) -> bool:
+    # Capability inspection is eager; leave device queries outside forward.
+    if query.device.type != "cuda" or not current_omni_platform.is_cuda():
+        return False
+    capability = current_omni_platform.get_device_capability(query.device.index)
+    return capability is not None and tuple(capability) in ((10, 0), (10, 3))
+
+
+def _normalize_trtllm_metadata(
+    attn_metadata: AttentionMetadata | None,
+) -> tuple[dict, bool, PackedPaddingMetadata | None]:
+    """Inspect host metadata only; never read device tensor values."""
+    extra = getattr(attn_metadata, "extra", {}) if attn_metadata is not None else {}
+    packed_keys = ("cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k")
+    present_packed_keys = [key for key in packed_keys if key in extra]
+    if present_packed_keys and len(present_packed_keys) != len(packed_keys):
+        missing = sorted(set(packed_keys) - set(present_packed_keys))
+        raise ValueError(f"Incomplete packed TRTLLM attention metadata; missing {missing}")
+    has_packed_metadata = len(present_packed_keys) == len(packed_keys)
+
+    attn_mask = getattr(attn_metadata, "attn_mask", None) if attn_metadata is not None else None
+    packed_padding = getattr(attn_metadata, "packed_padding", None) if attn_metadata is not None else None
+    if packed_padding is not None and not isinstance(packed_padding, PackedPaddingMetadata):
+        raise ValueError("packed_padding must be PackedPaddingMetadata")
+    if packed_padding is not None and not has_packed_metadata:
+        raise ValueError("PackedPaddingMetadata requires complete packed TRTLLM attention metadata")
+    if attn_mask is not None:
+        raise ValueError(
+            "TRTLLM_ATTN does not support attn_mask. Represent structural suffix padding "
+            "with packed-padding metadata, or select a mask-capable backend such as "
+            "CUDNN_ATTN or TORCH_SDPA."
+        )
+
+    return extra, has_packed_metadata, packed_padding
+
+
 class TrtllmAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
+
+    @classmethod
+    def resolve_capabilities(cls, context: ExecutionContext) -> ExecutionPathResult:
+        # Construction decides SAGE/skip settings; caller-provided kernel identity
+        # cannot establish the initialized path or a fullgraph guarantee.
+        return ExecutionPathResult.unmigrated(
+            cls.get_name(), replace(context, kernel_variant=None), path="uninitialized"
+        )
 
     @classmethod
     def supports_packed_mask_free(cls) -> bool:
@@ -322,6 +374,96 @@ class TrtllmAttentionImpl(AttentionImpl):
                     "install flashinfer >= 0.6.18rc10."
                 )
             self._sage_quantize_fn = flashinfer.trtllm_sage_attention_quantize
+
+    def resolve_execution_path(
+        self,
+        context: ExecutionContext,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+    ) -> ExecutionPathResult:
+        extra, packed, packed_padding = _normalize_trtllm_metadata(attn_metadata)
+        packing_mode = PackingMode.NONE
+        if packed_padding is not None:
+            packing_mode = PackingMode.PACKED_PADDING
+        elif packed:
+            packing_mode = PackingMode.MULTI_DOCUMENT
+        context = replace(
+            context,
+            kernel_variant="trtllm_sage" if self.quant.enabled else "trtllm",
+            dtype=str(query.dtype).removeprefix("torch."),
+            causal=self.causal,
+            mask_mode=MaskMode.NONE,
+            packing_mode=packing_mode,
+            piecewise=attn_metadata is not None and attn_metadata.full_attn_spans is not None,
+            kv_cache_dtype=extra.get("kv_cache_dtype"),
+        )
+        if self.quant.enabled:
+            path = "sage"
+        elif self.skip.configured:
+            path = "skip_softmax"
+        elif packed_padding is not None:
+            path = "packed_padding"
+        elif packed:
+            path = "packed_varlen"
+        else:
+            path = "dense"
+        result = ExecutionPathResult.unmigrated("TRTLLM_ATTN", context, path="trtllm_" + path)
+        if not HAS_FLASHINFER:
+            return replace(
+                result,
+                support=CapabilityResult.unsupported(
+                    "TRTLLM_ATTN requires FlashInfer; install it or select another backend."
+                ),
+            )
+        if (
+            context.platform != "cuda"
+            or not _is_trtllm_blackwell_device(query)
+            or path != "dense"
+            or self.causal
+            or context.dtype != "bfloat16"
+            or context.piecewise
+            or context.paged_kv
+            or context.kv_cache_dtype not in (None, "auto", "float")
+            or context.parallel_strategy is not ParallelStrategy.NONE
+            or context.outer_boundaries
+        ):
+            return replace(
+                result,
+                support=CapabilityResult.unmigrated(
+                    "Only dense noncausal BF16 TRTLLM on Blackwell SM100/SM103 "
+                    "without parallel or outer boundaries is migrated."
+                ),
+            )
+        if any(t.ndim != 4 for t in (query, key, value)):
+            reason = "Q, K, and V must have rank 4 (batch, sequence, heads, head dimension)."
+        elif query.dtype != key.dtype or query.dtype != value.dtype:
+            reason = "Q, K, and V dtypes must match."
+        elif query.device != key.device or query.device != value.device:
+            reason = "Q, K, and V devices must match."
+        elif key.shape != value.shape or query.shape[0] != key.shape[0] or query.shape[-1] != key.shape[-1]:
+            reason = "K/V shapes, Q/K batch sizes, and Q/K head dimensions must match."
+        elif any(size == 0 for t in (query, key, value) for size in t.shape):
+            reason = "Q, K, and V dimensions must be nonzero."
+        else:
+            reason = None
+        if reason:
+            return replace(
+                result,
+                support=CapabilityResult.unsupported(
+                    "TRTLLM_ATTN: " + reason + " Select compatible inputs or another backend."
+                ),
+            )
+        # This is a verified geometry, not an exhaustive list of kernel limits.
+        if query.shape[-1] != 128 or query.shape[2] != key.shape[2]:
+            return replace(
+                result,
+                support=CapabilityResult.unmigrated(
+                    "TRTLLM fullgraph validation covers head dimension 128 with equal Q/K/V head counts."
+                ),
+            )
+        return replace(result, support=CapabilityResult.supported(), compilation_mode=CompilationMode.CUSTOM_OP)
 
     def set_layer_calibration(self, a: float, b: float) -> None:
         self.skip = replace(self.skip, a=a, b=b)
@@ -453,26 +595,7 @@ class TrtllmAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        extra = getattr(attn_metadata, "extra", {}) if attn_metadata is not None else {}
-        packed_keys = ("cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k")
-        present_packed_keys = [key for key in packed_keys if key in extra]
-        if present_packed_keys and len(present_packed_keys) != len(packed_keys):
-            missing = sorted(set(packed_keys) - set(present_packed_keys))
-            raise ValueError(f"Incomplete packed TRTLLM attention metadata; missing {missing}")
-        has_packed_metadata = len(present_packed_keys) == len(packed_keys)
-
-        attn_mask = getattr(attn_metadata, "attn_mask", None) if attn_metadata is not None else None
-        packed_padding = getattr(attn_metadata, "packed_padding", None) if attn_metadata is not None else None
-        if packed_padding is not None and not isinstance(packed_padding, PackedPaddingMetadata):
-            raise ValueError("packed_padding must be PackedPaddingMetadata")
-        if packed_padding is not None and not has_packed_metadata:
-            raise ValueError("PackedPaddingMetadata requires complete packed TRTLLM attention metadata")
-        if attn_mask is not None:
-            raise ValueError(
-                "TRTLLM_ATTN does not support attn_mask. Represent structural suffix padding "
-                "with packed-padding metadata, or select a mask-capable backend such as "
-                "CUDNN_ATTN or TORCH_SDPA."
-            )
+        extra, has_packed_metadata, packed_padding = _normalize_trtllm_metadata(attn_metadata)
 
         if not HAS_FLASHINFER:
             raise ImportError(
@@ -545,16 +668,36 @@ class TrtllmAttentionImpl(AttentionImpl):
         sage_q_block_size = sage_k_block_size = 0
         if self.quant.enabled:
             q, k, v, sage_attn_sfs, sage_block_sizes = self.quant.quantize(
-                q, k, v, self._sage_quantize_fn, cu_seq_lens_q, cu_seq_lens_kv,
+                q,
+                k,
+                v,
+                self._sage_quantize_fn,
+                cu_seq_lens_q,
+                cu_seq_lens_kv,
             )
             sage_q_sf, sage_k_sf, _, sage_v_sf = sage_attn_sfs
             sage_q_block_size, sage_k_block_size, _, _ = sage_block_sizes
 
         out = _trtllm_ragged_attention_op(
-            q, k, v, workspace, seq_lens, cu_seq_lens_q, cu_seq_lens_kv,
-            sage_q_sf, sage_k_sf, sage_v_sf, max_q_len, max_kv_len, batch,
-            bmm1_scale, bmm2_scale, -1.0 if _skip_factor is None else _skip_factor,
-            sage_q_block_size, sage_k_block_size, self.causal,
+            q,
+            k,
+            v,
+            workspace,
+            seq_lens,
+            cu_seq_lens_q,
+            cu_seq_lens_kv,
+            sage_q_sf,
+            sage_k_sf,
+            sage_v_sf,
+            max_q_len,
+            max_kv_len,
+            batch,
+            bmm1_scale,
+            bmm2_scale,
+            -1.0 if _skip_factor is None else _skip_factor,
+            sage_q_block_size,
+            sage_k_block_size,
+            self.causal,
         )
         if out.shape[0] != output_tokens:
             padded_out = torch.zeros(
