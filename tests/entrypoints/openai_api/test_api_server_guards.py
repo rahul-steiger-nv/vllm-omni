@@ -47,6 +47,7 @@ from argparse import Namespace
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -57,7 +58,7 @@ from starlette.requests import Request
 from starlette.websockets import WebSocketDisconnect
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
-from vllm_omni.entrypoints.openai import api_server
+from vllm_omni.entrypoints.openai import api_server, realtime_connection
 from vllm_omni.entrypoints.serve.utils import errors as serve_errors
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -224,7 +225,6 @@ _MULTISTAGE_APP_STATE_KEYS = {
     "openai_streaming_speech",
     "openai_streaming_video",
     "openai_serving_duplex",
-    "openai_serving_realtime",
     "openai_serving_video",
     "openai_serving_realtime_robot",
     "rl_rollout_serving",
@@ -365,6 +365,8 @@ class _FakeSocket:
 
 
 class _FakeEngineClient:
+    config_path: str | None = None
+
     def __init__(self, *, stage_configs=None, endpoint_restrictions=None, vllm_config=None) -> None:
         self.stage_configs = stage_configs if stage_configs is not None else []
         self.endpoint_restrictions = endpoint_restrictions if endpoint_restrictions is not None else {}
@@ -564,7 +566,7 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     Fails if HTTP requests lose ``request_timestamp``, or WebSocket scopes
     start getting stamped / mutated incorrectly.
     """
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
     def fake_build_openai_app(args, supported_tasks):
         return FastAPI()
@@ -592,8 +594,8 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), _minimal_args())
     middleware = captured["served_app"]
 
-    http_scope = {"type": "http", "state": {}}
-    ws_scope = {"type": "websocket"}
+    http_scope: dict[str, Any] = {"type": "http", "state": {}}
+    ws_scope: dict[str, Any] = {"type": "websocket"}
 
     async def _receive():
         return {"type": "http.disconnect"}
@@ -672,7 +674,11 @@ async def test_realtime_route_defaults_to_configured_duplex_handler(
         async def handle_connection(self) -> None:
             calls.append("legacy")
 
-    monkeypatch.setattr(api_server, "RealtimeConnection", lambda _websocket, _serving: _LegacyConnection())
+    monkeypatch.setattr(
+        realtime_connection,
+        "RealtimeConnection",
+        lambda _websocket, _serving: _LegacyConnection(),
+    )
     query_params = {} if duplex_query is None else {"duplex": duplex_query}
     websocket = SimpleNamespace(
         app=SimpleNamespace(
@@ -820,6 +826,46 @@ def test_speech_without_handler_preserves_not_found_http_error() -> None:
     assert exc_info.value.detail == "The model does not support Speech API"
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "detail"),
+    [
+        ("modalities", [123], "modalities must be a list of strings"),
+        ("logprobs", "yes", "logprobs must be a boolean"),
+    ],
+)
+def test_chat_completion_raw_body_guards_reject_lax_types(field, value, detail) -> None:
+    """The HTTP boundary rejects values that upstream Pydantic would coerce."""
+    app = FastAPI()
+    app.state.openai_serving_chat = None
+    app.state.serving_tokenization = None
+    app.add_api_route("/v1/chat/completions", api_server.create_chat_completion, methods=["POST"])
+    client = TestClient(app)
+
+    payload = {
+        "model": "demo-model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": False,
+        field: value,
+    }
+    response = client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 400
+    assert detail in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "raw_body",
+    [
+        {"modalities": None},
+        {"logprobs": None},
+        {"modalities": None, "logprobs": None},
+    ],
+)
+def test_chat_completion_raw_body_guards_allow_null_defaults(raw_body) -> None:
+    """Explicit JSON null keeps the upstream request model's default behavior."""
+    api_server._validate_chat_completion_raw_body(raw_body)
+
+
 @pytest.mark.asyncio
 async def test_multi_api_rejects_runtime_voice_upload() -> None:
     app = FastAPI()
@@ -920,11 +966,10 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
     engine = _FakeEngineClient(stage_configs=[stage])
 
     def _for_diffusion_factory(label: str):
-        @classmethod
         def _factory(cls, *args, **kwargs):
             return _marker(label)
 
-        return _factory
+        return classmethod(_factory)
 
     monkeypatch.setattr(api_server.OmniOpenAIServingChat, "for_diffusion", _for_diffusion_factory("chat"))
     monkeypatch.setattr(api_server.OmniOpenAIServingChatBatch, "for_diffusion", _for_diffusion_factory("chat_batch"))
@@ -959,19 +1004,22 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch) -> None:
+async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch, tmp_path) -> None:
     stage = SimpleNamespace(stage_type="diffusion", engine_args={})
     engine = _FakeEngineClient(stage_configs=[stage])
+    base = tmp_path / "base.yaml"
+    base.write_text("speech_cache:\n  resolve_max_bytes: 1234\n  speaker_max_bytes: 0\n")
+    deploy = tmp_path / "deploy.yaml"
+    deploy.write_text("base_config: base.yaml\nspeech_cache:\n  resolve_max_entries: 17\n")
+    engine.config_path = str(deploy)
     speech_kwargs = {}
 
     def _for_diffusion_factory(label: str):
-        @classmethod
         def _factory(cls, *args, **kwargs):
             return _marker(label)
 
-        return _factory
+        return classmethod(_factory)
 
-    @classmethod
     def _speech_factory(cls, *args, **kwargs):
         speech_kwargs.update(kwargs)
         return _marker("speech")
@@ -985,7 +1033,7 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch) -> 
     )
     monkeypatch.setattr(api_server.OmniOpenAIServingVideo, "for_diffusion", _for_diffusion_factory("video"))
     monkeypatch.setattr(api_server.OmniStreamingVideoOutputHandler, "__init__", lambda self, *a, **k: None)
-    monkeypatch.setattr(api_server.OmniOpenAIServingSpeech, "for_diffusion", _speech_factory)
+    monkeypatch.setattr(api_server.OmniOpenAIServingSpeech, "for_diffusion", classmethod(_speech_factory))
     monkeypatch.setattr(
         api_server.ServingRealtimeRobotOpenPI,
         "create_policy_server",
@@ -1004,10 +1052,14 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch) -> 
 
     assert speech_kwargs["allowed_local_media_path"] == "/allowed/media"
     assert speech_kwargs["allowed_media_domains"] == ["media.example.com"]
+    config = speech_kwargs["speech_cache_config"]
+    assert config.resolve_max_bytes == 1234
+    assert config.resolve_max_entries == 17
+    assert config.speaker_max_bytes == 0
 
 
 @pytest.mark.asyncio
-async def test_multistage_app_state_key_snapshot(monkeypatch) -> None:
+async def test_multistage_app_state_key_snapshot(monkeypatch, tmp_path) -> None:
     """Lock multi-stage ``app.state`` keys after init, including live vs None.
 
     Fails if chat/speech/video/realtime/tokenization keys disappear or are
@@ -1037,7 +1089,15 @@ async def test_multistage_app_state_key_snapshot(monkeypatch) -> None:
         def warmup(self):
             return None
 
+    deploy = tmp_path / "deploy.yaml"
+    deploy.write_text("speech_cache:\n  resolve_max_bytes: 1024\n  speaker_max_bytes: 8\n")
+    engine.config_path = str(deploy)
+    speech_kwargs = {}
+
     class _FakeSpeech(_FakeCtor):
+        def __init__(self, *args, **kwargs):
+            speech_kwargs.update(kwargs)
+
         async def warmup(self):
             return None
 
@@ -1062,11 +1122,13 @@ async def test_multistage_app_state_key_snapshot(monkeypatch) -> None:
     monkeypatch.setattr(api_server, "OmniOpenAIServingAudioGenerate", _FakeCtor)
     monkeypatch.setattr(api_server, "OmniStreamingSpeechHandler", _FakeCtor)
     monkeypatch.setattr(api_server, "create_streaming_video_handler", lambda **_k: _marker("streaming_video"))
-    monkeypatch.setattr(api_server, "OpenAIServingRealtime", _FakeCtor)
     monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeCtor)
 
     state = State()
     await api_server.omni_init_app_state(engine, state, _minimal_args())
+    assert speech_kwargs["speech_cache_config"].resolve_max_bytes == 1024
+    assert speech_kwargs["speech_cache_config"].resolve_max_entries == 2048
+    assert speech_kwargs["speech_cache_config"].speaker_max_bytes == 8
 
     _assert_app_state_snapshot(
         state,
