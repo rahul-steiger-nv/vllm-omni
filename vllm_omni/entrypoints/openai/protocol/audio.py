@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import math
+from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
 import numpy as np
-from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, PrivateAttr, field_validator, model_validator
 
 # Bound int request fields to avoid overflow issues.
 _INT64_MIN = -(2**63)
@@ -55,7 +56,19 @@ def _normalize_speaker_embedding_value(value):
     return [float(x) for x in value]
 
 
+@dataclass(frozen=True)
+class RegisteredVoiceReference:
+    """Server-only snapshot of an uploaded audio generation."""
+
+    name: str
+    created_at: int
+    file_path: str
+    ref_text: str | None
+
+
 class OpenAICreateSpeechRequest(BaseModel):
+    _registered_voice_reference: RegisteredVoiceReference | None = PrivateAttr(default=None)
+
     input: str
     model: str | None = None
     # Accept both "voice" (OpenAI convention) and "speaker" (model/internal
@@ -353,6 +366,14 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
     input: str = Field(
         description="Text prompt describing the audio to generate",
     )
+
+    @field_validator("input")
+    @classmethod
+    def validate_input(cls, v):
+        if not v or not v.strip():
+            raise ValueError("input cannot be empty")
+        return v
+
     model: str | None = None
     response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
     speed: float | None = Field(
@@ -363,6 +384,7 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
     stream_format: Literal["sse", "audio"] | None = "audio"
     audio_length: float | None = Field(
         default=None,
+        gt=0,
         description="Audio length in seconds",
     )
     audio_start: float | None = Field(
@@ -375,12 +397,14 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
     )
     guidance_scale: float | None = Field(
         default=None,
+        ge=0,
+        le=1000,
         description="Guidance scale for diffusion models",
     )
     num_inference_steps: int | None = Field(
         default=None,
         ge=1,
-        le=_INT64_MAX,
+        le=1000,
         description="Number of inference steps",
     )
     seed: int | None = Field(
@@ -410,9 +434,23 @@ class CreateAudio(BaseModel):
         arbitrary_types_allowed = True
 
 
+class AudioChunkMetadata(BaseModel):
+    """Waveform dimensions after transforms, before encoding.
+
+    Frames count samples per channel, not interleaved scalar samples or bytes.
+    For compressed formats this excludes any padding introduced by the codec.
+    """
+
+    format: str = Field(min_length=1, strict=True)
+    sample_rate_hz: int = Field(gt=0, strict=True)
+    frame_count: int = Field(ge=0, strict=True)
+    channels: int = Field(gt=0, strict=True)
+
+
 class AudioResponse(BaseModel):
     audio_data: bytes | str
     media_type: str
+    audio_metadata: AudioChunkMetadata | None = None
 
 
 # --- Batch Speech Models ---
