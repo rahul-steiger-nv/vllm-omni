@@ -569,6 +569,27 @@ class TestCodePredictorPerRowGenerators:
             )
 
 
+@pytest.mark.parametrize("fused_requested", [False, True])
+@pytest.mark.parametrize("invalid_input", ["uniforms", "generators"])
+def test_sampling_contract_rejected_before_dispatch(mocker, loaded_target_classes, fused_requested, invalid_input):
+    predictor, talker_config = TestCodePredictorPerRowGenerators()._make_predictor(mocker, loaded_target_classes)
+    predictor._fused_requested = fused_requested
+    predictor._fused = mocker.Mock()
+    setup = mocker.patch.object(predictor, "_setup_compile")
+    uniforms = torch.full((2, 3, 1 if invalid_input == "uniforms" else 64), 0.5)
+    generators = [torch.Generator()] if invalid_input == "generators" else None
+    with pytest.raises(ValueError, match="sample_uniforms must have shape|one entry per row"):
+        predictor(
+            torch.zeros(2, dtype=torch.long),
+            torch.randn(2, talker_config.hidden_size),
+            torch.randn(2, talker_config.hidden_size),
+            sample_uniforms=uniforms,
+            generators=generators,
+        )
+    setup.assert_not_called()
+    predictor._fused.assert_not_called()
+
+
 class TestCodePredictorModelDtype:
     """Test the inner model forward with different dtypes."""
 
@@ -663,6 +684,8 @@ class TestCodePredictorGraphReplay:
 
         predictor = object.__new__(code_predictor_wrapper)
         torch.nn.Module.__init__(predictor)
+        predictor._fused_requested = False
+        predictor._fused = None
         predictor._num_groups = 3
         predictor._model_dtype = torch.float32
         predictor._setup_compile = mocker.Mock()

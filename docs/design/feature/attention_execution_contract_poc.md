@@ -161,3 +161,24 @@ and normalizes output strides to match its fake implementation.
 with a matching Sage3 binary, checking input preservation,
 full-graph replay against eager Sage3, and schema/fake agreement for head sizes
 64 and 128.
+
+## TRTLLM dense execution
+
+`TRTLLM_ATTN` declares `SUPPORTED` / `CUSTOM_OP` for noncausal dense BF16 on
+B200/GB200 (SM100) and B300/GB300 (SM103), head dimension 128, and equal Q/K/V
+head counts, without parallel, paged-KV, piecewise, or HSDP boundaries. Pre-construction, SAGE, skip-softmax, packed,
+and other unverified paths remain `UNMIGRATED`. Resolution and dispatch share
+metadata validation; workspace mutation is explicit in the custom-op schema.
+
+CPU contract tests cover fullgraph replay and schema/fake consistency using a
+substituted dispatcher. Real-kernel validation requires Blackwell with FlashInfer:
+
+```bash
+python -m pytest tests/diffusion/attention/test_trtllm_attn.py \
+  -k dense_contract_fullgraph_matches_sdpa -q -rs
+```
+
+These hardware tests compare eager/compiled output with FP32 SDPA and check
+schema/fake agreement. The TRTLLM and contract suite passed on Blackwell before the final architecture
+restriction was added: 61 passed, no skips (19 dependency deprecation warnings).
+The SM100/SM103 restriction is additionally covered by CPU contract tests.

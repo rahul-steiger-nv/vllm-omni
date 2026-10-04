@@ -954,7 +954,13 @@ class CodePredictorWrapper(nn.Module):
             extra_cfg = connector_cfg.get("extra", connector_cfg)
         else:
             extra_cfg = getattr(connector_cfg, "extra", None)
-        return extra_cfg if isinstance(extra_cfg, dict) else {}
+        extra_cfg = extra_cfg if isinstance(extra_cfg, dict) else {}
+        # A single-stage deployment has no connector edge to carry model
+        # options; it sets them in the stage's ``additional_config``.
+        additional = getattr(vllm_config, "additional_config", None)
+        if isinstance(additional, dict) and additional:
+            return {**additional, **extra_cfg}
+        return extra_cfg
 
     @staticmethod
     def _parse_bool_config(value: object) -> bool:
@@ -1332,6 +1338,21 @@ class CodePredictorWrapper(nn.Module):
             scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
         return self._sample_codes_gumbel(scaled, generator=generator, uniforms=uniforms)
 
+    def _validate_sampling_inputs(
+        self,
+        bsz: int,
+        generators: Sequence[torch.Generator | None] | None,
+        sample_uniforms: torch.Tensor | None,
+    ) -> None:
+        if generators is not None and len(generators) != bsz:
+            raise ValueError(f"generators must have one entry per row: got {len(generators)} for batch {bsz}")
+        if sample_uniforms is not None:
+            expected_shape = (bsz, self._num_groups - 1, int(self.config.vocab_size))
+            if tuple(sample_uniforms.shape) != expected_shape:
+                raise ValueError(
+                    f"sample_uniforms must have shape {expected_shape}, got {tuple(sample_uniforms.shape)}"
+                )
+
     @torch.inference_mode()
     def forward(
         self,
@@ -1349,14 +1370,7 @@ class CodePredictorWrapper(nn.Module):
         """Predict residual codebooks 1..G-1 autoregressively via re-prefill."""
         bsz = int(layer0_code.shape[0])
         num_groups = self._num_groups
-        if generators is not None and len(generators) != bsz:
-            raise ValueError(f"generators must have one entry per row: got {len(generators)} for batch {bsz}")
-        if sample_uniforms is not None:
-            expected_shape = (bsz, num_groups - 1, int(self.config.vocab_size))
-            if tuple(sample_uniforms.shape) != expected_shape:
-                raise ValueError(
-                    f"sample_uniforms must have shape {expected_shape}, got {tuple(sample_uniforms.shape)}"
-                )
+        self._validate_sampling_inputs(bsz, generators, sample_uniforms)
         sample_generator: _GeneratorLike = generators if generators is not None else generator
         device = layer0_code.device
 
