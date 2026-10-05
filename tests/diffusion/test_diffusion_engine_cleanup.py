@@ -87,7 +87,7 @@ def test_wait_output_ready_after_shutdown_fails_immediately() -> None:
 
     try:
         assert ready.done(), "A stopped executor must not create a waiter that cannot complete"
-        with pytest.raises(RuntimeError, match="(?i)shut down|shutdown|closed"):
+        with pytest.raises(RuntimeError, match="^Executor shut down$"):
             ready.result()
         assert not executor._output_futures
     finally:
