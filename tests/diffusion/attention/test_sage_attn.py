@@ -178,8 +178,11 @@ def test_sage_contract_and_forward_reject_masks(sage_contract, monkeypatch, plat
         raising=False,
     )
     metadata = AttentionMetadata(attn_mask=torch.tensor([[True] * 8 + [False] * 4]))
-    with pytest.raises(ValueError, match="does not support attn_mask"):
-        impl.resolve_execution_path(ExecutionContext(platform=platform), *inputs, metadata)
+    context = ExecutionContext(platform=platform)
+    result = impl.resolve_execution_path(context, *inputs, metadata)
+    assert result.support.status is SupportStatus.UNSUPPORTED
+    assert result.support.reason == "SAGE_ATTN: attn_mask is not supported"
+    assert result.requested_support(context).status is SupportStatus.UNSUPPORTED
     with pytest.raises(ValueError, match="does not support attn_mask"):
         impl.forward_cuda(*inputs, metadata)
     with pytest.raises(ValueError, match="does not support attn_mask"):

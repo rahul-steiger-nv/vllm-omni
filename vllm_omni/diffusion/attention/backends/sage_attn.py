@@ -154,10 +154,12 @@ class SageAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
     ) -> ExecutionPathResult:
-        _validate_sage_metadata(attn_metadata)
+        result = ExecutionPathResult.unmigrated("SAGE_ATTN", replace(context, kernel_variant=None), path="unverified")
+        if attn_metadata is not None and attn_metadata.attn_mask is not None:
+            return replace(result, support=CapabilityResult.unsupported("SAGE_ATTN: attn_mask is not supported"))
         # XPU's ARK route is separate and has not been migrated.
         if context.platform != "cuda":
-            return ExecutionPathResult.unmigrated("SAGE_ATTN", replace(context, kernel_variant=None), path="unverified")
+            return result
         extra = attn_metadata.extra if attn_metadata is not None else {}
         packed = any(name in extra for name in ("cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k"))
         if attn_metadata is not None and attn_metadata.packed_padding is not None:

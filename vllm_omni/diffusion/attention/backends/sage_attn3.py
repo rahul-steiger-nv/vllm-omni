@@ -126,7 +126,6 @@ class SageAttention3Impl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
     ) -> ExecutionPathResult:
-        _validate_sage3_metadata(attn_metadata)
         extra = attn_metadata.extra if attn_metadata is not None else {}
         packed = any(name in extra for name in ("cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k"))
         if attn_metadata is not None and attn_metadata.packed_padding is not None:
@@ -144,6 +143,8 @@ class SageAttention3Impl(AttentionImpl):
             kv_cache_dtype=extra.get("kv_cache_dtype"),
         )
         result = ExecutionPathResult.unmigrated("SAGE_ATTN_3", context, path="sage3_dense")
+        if attn_metadata is not None and attn_metadata.attn_mask is not None:
+            return replace(result, support=CapabilityResult.unsupported("SAGE_ATTN_3: attn_mask is not supported"))
         if any(t.ndim != 4 for t in (query, key, value)):
             reason = "Q, K, and V must have rank 4."
         elif query.dtype != key.dtype or query.dtype != value.dtype:

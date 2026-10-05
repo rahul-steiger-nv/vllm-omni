@@ -326,11 +326,10 @@ def test_sage3_unverified_and_invalid_paths(monkeypatch, case):
         v = v[:, :12]
     elif case == "mask":
         metadata = AttentionMetadata(attn_mask=torch.ones(1, 17))
-        with pytest.raises(ValueError, match="attn_mask"):
-            impl.resolve_execution_path(context, q, k, v, metadata)
-        return
     result = impl.resolve_execution_path(context, q, k, v, metadata)
-    expected = SupportStatus.UNSUPPORTED if case in ("dtype", "shape", "gqa", "dropout") else SupportStatus.UNMIGRATED
+    expected = (
+        SupportStatus.UNSUPPORTED if case in ("dtype", "shape", "gqa", "dropout", "mask") else SupportStatus.UNMIGRATED
+    )
     assert result.support.status is expected
 
 
@@ -406,3 +405,26 @@ def test_sage3_rejects_dropout_before_variant_gate_and_kernel(monkeypatch, varia
     with pytest.raises(ValueError) as exc_info:
         impl.forward_cuda(q, q, q)
     assert str(exc_info.value) == reason
+
+
+@pytest.mark.parametrize("variant", [None, "sage3_sm100", "sage3_sm120", "sage3_sm121"])
+def test_sage3_mask_inspection_returns_unsupported(monkeypatch, variant):
+    from vllm_omni.diffusion.attention.capabilities import ExecutionContext, SupportStatus
+
+    def kernel(*args, **kwargs):
+        raise AssertionError("Sage3 must reject masks before invoking the kernel")
+
+    module = load_sage_attn3_module(monkeypatch, kernel)
+    monkeypatch.setattr(module, "_sage3_kernel_variant", lambda q: variant)
+    impl = module.SageAttention3Impl(2, 64, 0.125)
+    q = torch.empty(1, 12, 2, 64, dtype=torch.bfloat16)
+    metadata = AttentionMetadata(attn_mask=torch.tensor([[True] * 8 + [False] * 4]))
+    context = ExecutionContext(platform="cuda" if variant else "cpu")
+
+    result = impl.resolve_execution_path(context, q, q, q, metadata)
+
+    assert result.support.status is SupportStatus.UNSUPPORTED
+    assert result.support.reason == "SAGE_ATTN_3: attn_mask is not supported"
+    assert result.requested_support(context).status is SupportStatus.UNSUPPORTED
+    with pytest.raises(ValueError, match="does not support attn_mask"):
+        impl.forward_cuda(q, q, q, metadata)
