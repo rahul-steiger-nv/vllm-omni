@@ -154,10 +154,10 @@ class SageAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
     ) -> ExecutionPathResult:
+        _validate_sage_metadata(attn_metadata)
         # XPU's ARK route is separate and has not been migrated.
         if context.platform != "cuda":
             return ExecutionPathResult.unmigrated("SAGE_ATTN", replace(context, kernel_variant=None), path="unverified")
-        _validate_sage_metadata(attn_metadata)
         extra = attn_metadata.extra if attn_metadata is not None else {}
         packed = any(name in extra for name in ("cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k"))
         if attn_metadata is not None and attn_metadata.packed_padding is not None:
@@ -263,6 +263,7 @@ class SageAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        _validate_sage_metadata(attn_metadata)
         if xpu_sageattn is None:
             raise ImportError("XPU SageAttention requires auto-round-lib. Install with: pip install auto-round-lib")
         orig_dtype = query.dtype

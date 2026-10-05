@@ -167,14 +167,23 @@ def test_sage_special_metadata_is_not_migrated(sage_contract, metadata):
     assert impl.resolve_execution_path(context, *inputs, None).support.status is SupportStatus.SUPPORTED
 
 
-def test_sage_contract_and_forward_reject_masks(sage_contract):
+@pytest.mark.parametrize("platform", ["cuda", "xpu", "rocm", "cpu"])
+def test_sage_contract_and_forward_reject_masks(sage_contract, monkeypatch, platform):
     impl = sage_contract.SageAttentionImpl(4, 64, 0.17)
     inputs = _contract_inputs()
-    metadata = AttentionMetadata(attn_mask=torch.ones(1, 12, dtype=torch.bool))
+    monkeypatch.setattr(
+        sage_contract,
+        "xpu_sageattn",
+        lambda *args, **kwargs: pytest.fail("unexpected XPU Sage kernel call"),
+        raising=False,
+    )
+    metadata = AttentionMetadata(attn_mask=torch.tensor([[True] * 8 + [False] * 4]))
     with pytest.raises(ValueError, match="does not support attn_mask"):
-        impl.resolve_execution_path(ExecutionContext(platform="cuda"), *inputs, metadata)
+        impl.resolve_execution_path(ExecutionContext(platform=platform), *inputs, metadata)
     with pytest.raises(ValueError, match="does not support attn_mask"):
         impl.forward_cuda(*inputs, metadata)
+    with pytest.raises(ValueError, match="does not support attn_mask"):
+        impl.forward_xpu(*inputs, metadata)
 
 
 def test_sage_missing_dependency(sage_contract, monkeypatch):
