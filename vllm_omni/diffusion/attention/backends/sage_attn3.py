@@ -161,6 +161,8 @@ class SageAttention3Impl(AttentionImpl):
             )
         elif not math.isclose(self.softmax_scale, query.shape[-1] ** -0.5, rel_tol=1e-6):
             reason = f"softmax_scale {self.softmax_scale} does not match head dim {query.shape[-1]}."
+        elif self.dropout != 0.0:
+            reason = f"does not support dropout (dropout_p={self.dropout})."
         else:
             reason = None
         if reason:
@@ -175,7 +177,6 @@ class SageAttention3Impl(AttentionImpl):
             or context.kv_cache_dtype not in (None, "auto", "float")
             or context.parallel_strategy is not ParallelStrategy.NONE
             or context.outer_boundaries
-            or self.dropout != 0.0
         ):
             return result
         # D=256 can dispatch to SDPA; only the tested FP4 paths are verified.
@@ -195,6 +196,8 @@ class SageAttention3Impl(AttentionImpl):
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         _validate_sage3_metadata(attn_metadata)
+        if self.dropout != 0.0:
+            raise ValueError(f"SAGE_ATTN_3: does not support dropout (dropout_p={self.dropout}).")
         # The constructor validates scale against head_size. An integer shape
         # guard preserves that contract under dynamic fullgraph compilation.
         if query.shape[-1] != self.head_size:
