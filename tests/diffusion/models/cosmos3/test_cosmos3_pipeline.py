@@ -1595,6 +1595,7 @@ def test_forward_narrows_using_request_guardrail_setting(
     make_cosmos3_pipeline, fake_cosmos3_guardrails, monkeypatch: pytest.MonkeyPatch, guardrails_enabled: bool
 ) -> None:
     pipeline = make_cosmos3_pipeline()
+    pipeline.od_config.video_output_transport = SimpleNamespace(enable_device_postprocess=True)
     pipeline._format_and_tokenize_prompts = lambda *args, **kwargs: (_ids(1), _mask(), _ids(0), _mask())
     video = torch.full((1, 3, 5, 16, 16), 0.50390625, dtype=torch.bfloat16)
     pipeline._decode_latents = lambda latents: video
@@ -1621,6 +1622,121 @@ def test_forward_narrows_using_request_guardrail_setting(
     assert output.dtype == torch.uint8
     assert output.shape == (1, 5, 16, 16, 3)
     assert torch.all(output == (192 if guardrails_enabled else 191))
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["disabled", "default", "enable_cpu_offload", "enable_layerwise_offload", "enable_distributed_layerwise_offload"],
+)
+def test_forward_keeps_float_video_when_device_conversion_is_disabled(
+    make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch, reason: str
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline.od_config.video_output_transport = SimpleNamespace(enable_device_postprocess=reason != "disabled")
+    if reason == "default":
+        from vllm_omni.diffusion.data import VideoOutputTransportConfig
+
+        pipeline.od_config.video_output_transport = VideoOutputTransportConfig()
+    elif reason.startswith("enable_"):
+        setattr(pipeline.od_config, reason, True)
+    pipeline._format_and_tokenize_prompts = lambda *args, **kwargs: (_ids(1), _mask(), _ids(0), _mask())
+    video = torch.full((1, 3, 5, 16, 16), 0.50390625, dtype=torch.bfloat16)
+    pipeline._decode_latents = lambda latents: video
+    monkeypatch.setattr(
+        pipeline_cosmos3, "to_display_uint8", lambda *args, **kwargs: pytest.fail("device conversion must be skipped")
+    )
+    sp = make_sampling_params(
+        guidance_scale=1.0, num_inference_steps=1, num_frames=5, height=16, width=16, output_type="uint8"
+    )
+    request = make_request_batch({"prompt": "A test video.", "modalities": ["video"]}, sp)
+
+    assert pipeline.forward(request).output["video"] is video
+
+
+@pytest.mark.parametrize("failure", ["output_allocation", "chunk_conversion", "unrelated_error"])
+def test_forward_device_conversion_oom_preserves_float_video(
+    make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    import weakref
+
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline.od_config.video_output_transport = SimpleNamespace(enable_device_postprocess=True)
+    pipeline._format_and_tokenize_prompts = lambda *args, **kwargs: (_ids(1), _mask(), _ids(0), _mask())
+    video = torch.full((1, 3, 5, 16, 16), 0.50390625, dtype=torch.bfloat16)
+    original = video.clone()
+    pipeline._decode_latents = lambda latents: video
+    real_convert = pipeline_cosmos3.to_display_uint8
+    real_empty, real_to = torch.empty, torch.Tensor.to
+    buffers = []
+    cleanup = []
+
+    def empty(*args, **kwargs):
+        if failure == "output_allocation":
+            raise torch.OutOfMemoryError("forced output allocation OOM")
+        result = real_empty(*args, **kwargs)
+        buffers.append(weakref.ref(result))
+        return result
+
+    def to(tensor, *args, **kwargs):
+        if args == (torch.uint8,):
+            buffers.append(weakref.ref(tensor))
+            error = RuntimeError if failure == "unrelated_error" else torch.OutOfMemoryError
+            raise error("forced chunk conversion failure")
+        return real_to(tensor, *args, **kwargs)
+
+    def convert(*args, **kwargs):
+        with monkeypatch.context() as patch:
+            patch.setattr(torch, "empty", empty)
+            patch.setattr(torch.Tensor, "to", to)
+            return real_convert(*args, **kwargs)
+
+    def empty_cache():
+        assert all(ref() is None for ref in buffers), "conversion traceback must be released before cleanup"
+        cleanup.append("empty_cache")
+
+    monkeypatch.setattr(pipeline_cosmos3, "to_display_uint8", convert)
+    monkeypatch.setattr(pipeline_cosmos3.current_omni_platform, "empty_cache", empty_cache)
+    monkeypatch.setattr(pipeline_cosmos3.current_omni_platform, "synchronize", lambda: cleanup.append("synchronize"))
+    sp = make_sampling_params(
+        guidance_scale=1.0, num_inference_steps=1, num_frames=5, height=16, width=16, output_type="uint8"
+    )
+    request = make_request_batch({"prompt": "A test video.", "modalities": ["video"]}, sp)
+    if failure == "unrelated_error":
+        with pytest.raises(RuntimeError, match="forced chunk conversion failure"):
+            pipeline.forward(request)
+        assert not cleanup
+    else:
+        output = pipeline.forward(request).output["video"]
+        assert output is video
+        assert torch.equal(video, original)
+        assert cleanup == ["empty_cache", "synchronize"]
+        monkeypatch.setattr(pipeline_cosmos3, "to_display_uint8", real_convert)
+        postprocess = pipeline_cosmos3.get_cosmos3_post_process_func(pipeline.od_config)
+        np.testing.assert_array_equal(
+            postprocess({"video": output}, output_type="uint8"), real_convert(original).numpy()
+        )
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_postprocess_float_fallback_converts_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    video = torch.full((1, 3, 5, 16, 16), 0.50390625, dtype=torch.bfloat16, device="cuda")
+    real_convert = pipeline_cosmos3.to_display_uint8
+    expected = real_convert(video.cpu()).numpy()
+
+    def convert(tensor, **kwargs):
+        assert tensor.device.type == "cpu", "float fallback must not retry device allocation"
+        return real_convert(tensor, **kwargs)
+
+    monkeypatch.setattr(pipeline_cosmos3, "to_display_uint8", convert)
+    postprocess = pipeline_cosmos3.get_cosmos3_post_process_func(SimpleNamespace())
+    np.testing.assert_array_equal(postprocess({"video": video}, output_type="uint8"), expected)
 
 
 def test_to_display_uint8_matches_the_float_path_it_replaces() -> None:

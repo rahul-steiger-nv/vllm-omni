@@ -83,6 +83,7 @@ from vllm_omni.experimental.world_models.session_state import (
     resolve_session_state_config,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.platforms import current_omni_platform
 
 from .action import (
     ACTION_MODE_FORWARD_DYNAMICS,
@@ -749,9 +750,20 @@ def _should_narrow_video_output(
     is_t2i: bool,
     enable_cpu_offload: bool,
     output_type: str = "np",
+    enable_device_postprocess: bool = True,
+    enable_layerwise_offload: bool = False,
+    enable_distributed_layerwise_offload: bool = False,
 ) -> bool:
     """Narrow only byte-consuming output with GPU post-decode headroom."""
-    return is_output_rank and not is_t2i and not enable_cpu_offload and output_type in ("pil", "uint8")
+    return (
+        is_output_rank
+        and not is_t2i
+        and enable_device_postprocess
+        and not enable_cpu_offload
+        and not enable_layerwise_offload
+        and not enable_distributed_layerwise_offload
+        and output_type in ("pil", "uint8")
+    )
 
 
 def _display_uint8_to_pil(video: torch.Tensor) -> list[list[PIL.Image.Image]]:
@@ -883,6 +895,10 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
                     "metadata": envelope_public_metadata,
                 }
             return processed_image
+        # Device conversion may have been disabled or failed with OOM. Finish
+        # byte conversion on the host, even for small payloads that bypass D2H.
+        if output_type == "uint8" and video.dtype != torch.uint8:
+            video = video.detach().cpu()
         guardrails_enabled = is_guardrails_enabled(od_config, sampling_params)
         if guardrails_enabled:
             video = check_video_safety(video)
@@ -4236,13 +4252,30 @@ class Cosmos3OmniDiffusersPipeline(
             is_t2i=is_t2i,
             enable_cpu_offload=bool(getattr(self.od_config, "enable_cpu_offload", False)),
             output_type=_video_output_type(sp),
+            enable_device_postprocess=bool(
+                getattr(getattr(self.od_config, "video_output_transport", None), "enable_device_postprocess", False)
+            ),
+            enable_layerwise_offload=bool(getattr(self.od_config, "enable_layerwise_offload", False)),
+            enable_distributed_layerwise_offload=bool(
+                getattr(self.od_config, "enable_distributed_layerwise_offload", False)
+            ),
         ):
             # T2I keeps the VAE range because its postprocess hands back PIL
-            # images. CPU offload keeps conversion on the host to preserve the
+            # images. Offload keeps conversion on the host to preserve the
             # post-decode memory headroom it was enabled to provide.
             from .guardrails import is_guardrails_enabled
 
-            video = to_display_uint8(video, guardrails_enabled=is_guardrails_enabled(self.od_config, sp))
+            conversion_oom = False
+            try:
+                video = to_display_uint8(video, guardrails_enabled=is_guardrails_enabled(self.od_config, sp))
+            except torch.OutOfMemoryError:
+                logger.warning("Cosmos3 device video conversion ran out of memory; using float transport")
+                conversion_oom = True
+            if conversion_oom:
+                # Release the exception traceback and its conversion buffers
+                # before allocator cleanup, retaining the original VAE tensor.
+                current_omni_platform.empty_cache()
+                current_omni_platform.synchronize()
         if _is_rank_zero():
             logger.info("Video decoded in %.2fs", time.time() - decode_start)
             if not sound_enabled:
