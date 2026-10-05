@@ -12,6 +12,7 @@ import queue
 import threading
 import time
 from collections.abc import AsyncGenerator, Iterable
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -1197,16 +1198,15 @@ class DiffusionEngine:
             for async_output_id in abandoned_ids:
                 self.executor.drop_output(async_output_id)
 
-    async def async_add_req_and_stream_response(
-        self, request: OmniDiffusionRequest
-    ) -> AsyncGenerator[DiffusionOutput, None]:
+    def async_add_req_and_stream_response(self, request: OmniDiffusionRequest) -> AsyncGenerator[DiffusionOutput, None]:
         request_id = self.add_request(request)
-        stream = self.get_output_stream(request_id)
-        try:
-            async for output in stream:
-                yield output
-        finally:
-            await stream.aclose()
+
+        async def stream_response() -> AsyncGenerator[DiffusionOutput, None]:
+            async with aclosing(self.get_output_stream(request_id)) as stream:
+                async for output in stream:
+                    yield output
+
+        return stream_response()
 
     async def async_add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         """Deprecated compatibility wrapper over ``async_add_req_and_stream_response()``.

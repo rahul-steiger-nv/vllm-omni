@@ -146,15 +146,51 @@ def test_put_output_discards_async_output_when_stream_is_missing() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unstarted_stream_does_not_admit_request() -> None:
+async def test_stream_admits_request_before_iteration() -> None:
     engine = _make_engine()
     request = _make_request("unstarted")
 
     stream = engine.async_add_req_and_stream_response(request)
+
+    assert engine.scheduler.get_request_state(request.request_id) is not None
+    assert request.request_id in engine._out_streams
+    engine.abort(request.request_id)
+    assert engine.abort_queue.get_nowait() == request.request_id
     await stream.aclose()
 
-    assert engine.scheduler.get_request_state(request.request_id) is None
-    assert request.request_id not in engine._out_streams
+
+@pytest.mark.parametrize("closed", [False, True])
+def test_stream_admission_errors_are_raised_at_call_site(closed: bool) -> None:
+    engine = _make_engine()
+    engine._closed = closed
+    if closed:
+        error_type = RuntimeError
+        message = "DiffusionEngine is closed."
+    else:
+        error_type = ValueError
+        message = "invalid request"
+        engine.pre_process_func = Mock(side_effect=ValueError(message))
+
+    with pytest.raises(error_type, match=message):
+        engine.async_add_req_and_stream_response(_make_request("invalid"))
+    assert not engine._out_streams
+
+
+@pytest.mark.asyncio
+async def test_closing_response_stream_closes_inner_stream() -> None:
+    engine = _make_engine()
+    engine.main_loop = None
+    request = _make_request("close-wrapper")
+    stream = engine.async_add_req_and_stream_response(request)
+    engine._put_output(request.request_id, DiffusionOutput(finished=False))
+    await anext(stream)
+    engine._put_output(request.request_id, DiffusionOutput(async_output_id="aid-unclaimed"))
+
+    await stream.aclose()
+
+    engine.executor.drop_output.assert_called_once_with("aid-unclaimed")
+    assert not engine._out_streams
+    assert not engine._unclaimed_async_outputs
 
 
 @pytest.mark.asyncio

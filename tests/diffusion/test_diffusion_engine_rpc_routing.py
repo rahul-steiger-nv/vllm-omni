@@ -522,6 +522,7 @@ async def test_native_kv_reservation_error_wakes_stream_without_killing_busy_loo
     request.diffusion_kv_requests = (object(),)
     try:
         response_stream = engine.async_add_req_and_stream_response(request)
+        assert request.request_id in engine._out_streams
         output = await asyncio.wait_for(anext(response_stream), timeout=3.0)
         assert output.error == "native allocation bug"
         assert output.finished
