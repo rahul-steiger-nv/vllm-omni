@@ -19,6 +19,49 @@ from vllm_omni.diffusion.models.cosmos3 import guardrails
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+@pytest.mark.parametrize("chunk_bytes", [1, 64 << 20])
+@pytest.mark.parametrize("modify_frames", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_display_conversion_preserves_guardrail_input_and_output_bytes(
+    monkeypatch: pytest.MonkeyPatch, chunk_bytes: int, modify_frames: bool, dtype: torch.dtype, device: str
+) -> None:
+    from diffusers.video_processor import VideoProcessor
+
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    monkeypatch.setattr(pipeline_cosmos3, "_DISPLAY_CHUNK_BYTES", chunk_bytes)
+    # Include bf16 rounding boundaries, saturation, and both ends of the range.
+    values = torch.tensor([-1.4, -1, -0.50390625, 0, 0.50390625, 1, 1.4], dtype=dtype)
+    video = values.view(1, 1, 7, 1, 1).expand(1, 3, 7, 2, 2).clone().to(device)
+    original = video.clone()
+    captured: list[np.ndarray] = []
+
+    def check(frames: np.ndarray) -> np.ndarray:
+        captured.append(frames.copy())
+        if modify_frames:
+            # Exercise the adapter's handling of modified guardrail output,
+            # including every possible byte through the old float round trip.
+            return np.arange(256 * 3, dtype=np.int64).astype(np.uint8).reshape(1, 16, 16, 3)
+        return frames
+
+    monkeypatch.setattr(guardrails, "_video_guardrail", check)
+    old_checked = guardrails.check_video_safety(video)
+    reference = VideoProcessor(vae_scale_factor=16).postprocess_video(old_checked, output_type="np")
+    expected = np.round(np.clip(reference, 0, 1) * 255).astype(np.uint8)
+
+    narrowed = pipeline_cosmos3.to_display_uint8(video, guardrails_enabled=True)
+    checked = guardrails.check_video_safety(narrowed)
+
+    assert np.array_equal(captured[0], captured[1])
+    assert np.array_equal(checked.cpu().numpy(), expected)
+    assert torch.equal(video, original)
+    if dtype == torch.bfloat16:
+        assert not torch.equal(narrowed, pipeline_cosmos3.to_display_uint8(video))
+
+
 def test_check_video_safety_is_a_no_op_when_no_guardrail_is_loaded() -> None:
     frames = torch.zeros(1, 2, 4, 4, 3, dtype=torch.uint8)
 

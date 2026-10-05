@@ -1590,6 +1590,39 @@ def test_postprocess_handles_image_video_audio_and_validation() -> None:
         func({"image": video, "video": video})
 
 
+@pytest.mark.parametrize("guardrails_enabled", [False, True])
+def test_forward_narrows_using_request_guardrail_setting(
+    make_cosmos3_pipeline, fake_cosmos3_guardrails, monkeypatch: pytest.MonkeyPatch, guardrails_enabled: bool
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline._format_and_tokenize_prompts = lambda *args, **kwargs: (_ids(1), _mask(), _ids(0), _mask())
+    video = torch.full((1, 3, 5, 16, 16), 0.50390625, dtype=torch.bfloat16)
+    pipeline._decode_latents = lambda latents: video
+    sp = make_sampling_params(
+        guidance_scale=1.0,
+        num_inference_steps=1,
+        num_frames=5,
+        height=16,
+        width=16,
+        output_type="uint8",
+        extra_args={"guardrails": guardrails_enabled},
+    )
+    calls = []
+
+    def resolve_guardrails(config, sampling_params=None):
+        calls.append((config, sampling_params))
+        return sampling_params.extra_args["guardrails"]
+
+    monkeypatch.setattr(fake_cosmos3_guardrails, "is_guardrails_enabled", resolve_guardrails)
+    request = make_request_batch({"prompt": "A test video.", "modalities": ["video"]}, sp)
+    output = pipeline.forward(request).output["video"]
+
+    assert calls == [(pipeline.od_config, sp)]
+    assert output.dtype == torch.uint8
+    assert output.shape == (1, 5, 16, 16, 3)
+    assert torch.all(output == (192 if guardrails_enabled else 191))
+
+
 def test_to_display_uint8_matches_the_float_path_it_replaces() -> None:
     """The conversion moved to the GPU must not change a single pixel.
 

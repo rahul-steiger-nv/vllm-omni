@@ -700,17 +700,17 @@ def _display_chunk_frame_count(video: torch.Tensor, chunk_bytes: int | None = No
     return max(1, chunk_bytes // intermediate_bytes_per_frame)
 
 
-def to_display_uint8(video: torch.Tensor) -> torch.Tensor:
+def to_display_uint8(video: torch.Tensor, *, guardrails_enabled: bool = False) -> torch.Tensor:
     """Convert a decoded video from VAE range to display-ready uint8 frames.
 
     The VAE emits ``[B, C, T, H, W]`` in ``[-1, 1]``; every consumer ultimately
     wants ``[B, T, H, W, C]`` uint8 in ``[0, 255]``. Narrowing before IPC
     reduces the device-to-host and shared-memory payload.
 
-    The arithmetic runs in float32 and matches the old two-step path exactly —
-    ``postprocess_video`` produced ``(x / 2 + 0.5).clamp(0, 1)`` and the encoders
-    then scaled and rounded — so output is bit-identical to what callers saw, and
-    slicing does not change that because frames convert independently.
+    Without guardrails, denormalization preserves the decode dtype to match
+    historical ``VideoProcessor`` bytes. With guardrails, cast to float32 first
+    and clamp before denormalization to match the historical guardrail input.
+    Both paths scale and round in float32, with chunked intermediates.
     """
     video = video.detach()
     batch, channels, frames, height, width = video.shape
@@ -723,10 +723,12 @@ def to_display_uint8(video: torch.Tensor) -> torch.Tensor:
     step = _display_chunk_frame_count(video)
     for start in range(0, frames, step):
         stop = min(start + step, frames)
-        # Preserve the input dtype for denormalization to match the historical
-        # VideoProcessor path, which performed this arithmetic before casting
-        # to float32 for NumPy.
-        chunk = video[:, :, start:stop].permute(0, 2, 3, 4, 1).to(video.dtype, copy=True)
+        # Guardrails historically denormalized in float32; VideoProcessor used
+        # the decode dtype. Preserve both paths' bytes before narrowing for IPC.
+        dtype = torch.float32 if guardrails_enabled else video.dtype
+        chunk = video[:, :, start:stop].permute(0, 2, 3, 4, 1).to(dtype, copy=True)
+        if guardrails_enabled:
+            chunk.clamp_(-1, 1)
         chunk = chunk.mul_(0.5).add_(0.5).clamp_(0, 1)
         if chunk.dtype != torch.float32:
             chunk = chunk.float()
@@ -4238,7 +4240,9 @@ class Cosmos3OmniDiffusersPipeline(
             # T2I keeps the VAE range because its postprocess hands back PIL
             # images. CPU offload keeps conversion on the host to preserve the
             # post-decode memory headroom it was enabled to provide.
-            video = to_display_uint8(video)
+            from .guardrails import is_guardrails_enabled
+
+            video = to_display_uint8(video, guardrails_enabled=is_guardrails_enabled(self.od_config, sp))
         if _is_rank_zero():
             logger.info("Video decoded in %.2fs", time.time() - decode_start)
             if not sound_enabled:
