@@ -1598,9 +1598,12 @@ class DiffusionEngine:
                     self.stop_event.set()
                 pending_streams = list(self._out_streams.values())
                 self._out_streams.clear()
-                for async_output_ids in self._unclaimed_async_outputs.values():
-                    abandoned_ids.update(async_output_ids)
-                self._unclaimed_async_outputs.clear()
+                # Registered streams retain ownership of queued outputs until
+                # their consumers finish draining or close their generators.
+                live_streams = set(pending_streams)
+                for stream in list(self._unclaimed_async_outputs):
+                    if stream not in live_streams:
+                        abandoned_ids.update(self._unclaimed_async_outputs.pop(stream))
                 self._cv.notify_all()
 
         for async_output_id in abandoned_ids:

@@ -83,6 +83,60 @@ def test_close_completes_pending_output_streams() -> None:
         event_loop.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finished", [False, True])
+async def test_close_preserves_cached_output_for_live_consumer(finished: bool) -> None:
+    engine = _make_engine()
+    engine.main_loop = None
+    executor = _make_output_executor()
+    # Isolate stream ownership from executor teardown, which clears its cache.
+    executor.shutdown = Mock()
+    engine.executor = executor
+    request_id = "live"
+    output_queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+    engine._out_streams[request_id] = output_queue
+    stream = engine.get_output_stream(request_id)
+    next_output = asyncio.create_task(anext(stream))
+    await asyncio.sleep(0)
+
+    materialized_output = DiffusionOutput(output="cached", finished=finished)
+    ready: concurrent.futures.Future[DiffusionOutput] = concurrent.futures.Future()
+    ready.set_result(materialized_output)
+    executor._completed_outputs["aid-live"] = ready
+    engine._put_output(request_id, DiffusionOutput(async_output_id="aid-live", finished=finished))
+
+    engine.close()
+
+    assert engine._unclaimed_async_outputs == {output_queue: {"aid-live"}}
+    assert await next_output is materialized_output
+    if not finished:
+        closed_output = await anext(stream)
+        assert closed_output.error == "DiffusionEngine is closed."
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+    assert not engine._unclaimed_async_outputs
+    assert not executor._completed_outputs
+    assert not executor._dropped_output_ids
+
+
+def test_close_discards_only_outputs_without_registered_streams() -> None:
+    engine = _make_engine()
+    engine.main_loop = None
+    live_queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+    abandoned_queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+    engine._out_streams["reused"] = live_queue
+    engine._unclaimed_async_outputs = {
+        live_queue: {"aid-live"},
+        abandoned_queue: {"aid-abandoned"},
+    }
+
+    engine.close()
+    engine.close()
+
+    engine.executor.drop_output.assert_called_once_with("aid-abandoned")
+    assert engine._unclaimed_async_outputs == {live_queue: {"aid-live"}}
+
+
 def test_put_output_discards_async_output_when_stream_is_missing() -> None:
     engine = _make_engine()
 
