@@ -143,6 +143,25 @@ class SageAttention3Impl(AttentionImpl):
             kv_cache_dtype=extra.get("kv_cache_dtype"),
         )
         result = ExecutionPathResult.unmigrated("SAGE_ATTN_3", context, path="sage3_dense")
+        if any(t.ndim != 4 for t in (query, key, value)):
+            reason = "Q, K, and V must have rank 4."
+        elif query.dtype != key.dtype or query.dtype != value.dtype:
+            reason = "Q, K, and V dtypes must match."
+        elif query.device != key.device or query.device != value.device:
+            reason = "Q, K, and V devices must match."
+        elif key.shape != value.shape or query.shape[0] != key.shape[0] or query.shape[-1] != key.shape[-1]:
+            reason = "K/V shapes, Q/K batch sizes, and Q/K head dimensions must match."
+        elif any(size == 0 for t in (query, key, value) for size in t.shape):
+            reason = "Q, K, and V dimensions must be nonzero."
+        elif query.shape[2] != key.shape[2]:
+            reason = (
+                "does not support GQA/MQA "
+                f"(q_heads={query.shape[2]}, kv_heads={key.shape[2]}). Select a GQA-capable backend."
+            )
+        else:
+            reason = None
+        if reason:
+            return replace(result, support=CapabilityResult.unsupported("SAGE_ATTN_3: " + reason))
         if (
             context.platform != "cuda"
             or context.kernel_variant != "sage3_sm120"
@@ -156,24 +175,9 @@ class SageAttention3Impl(AttentionImpl):
             or self.dropout != 0.0
         ):
             return result
-        if any(t.ndim != 4 for t in (query, key, value)):
-            reason = "Q, K, and V must have rank 4."
-        elif query.dtype != key.dtype or query.dtype != value.dtype:
-            reason = "Q, K, and V dtypes must match."
-        elif query.device != key.device or query.device != value.device:
-            reason = "Q, K, and V devices must match."
-        elif key.shape != value.shape or query.shape[0] != key.shape[0] or query.shape[-1] != key.shape[-1]:
-            reason = "K/V shapes, Q/K batch sizes, and Q/K head dimensions must match."
-        elif any(size == 0 for t in (query, key, value) for size in t.shape):
-            reason = "Q, K, and V dimensions must be nonzero."
-        else:
-            reason = None
-        if reason:
-            return replace(result, support=CapabilityResult.unsupported("SAGE_ATTN_3: " + reason))
         # D=256 can dispatch to SDPA; only the tested FP4 paths are verified.
         if (
             query.shape[-1] not in (64, 128)
-            or query.shape[2] != key.shape[2]
             or any(t.stride(-1) != 1 for t in (query, key, value))
             or (self.causal and query.shape[1] != key.shape[1])
             or not math.isclose(self.softmax_scale, query.shape[-1] ** -0.5, rel_tol=1e-6)

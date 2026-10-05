@@ -330,5 +330,28 @@ def test_sage3_unverified_and_invalid_paths(monkeypatch, case):
             impl.resolve_execution_path(context, q, k, v, metadata)
         return
     result = impl.resolve_execution_path(context, q, k, v, metadata)
-    expected = SupportStatus.UNSUPPORTED if case in ("dtype", "shape") else SupportStatus.UNMIGRATED
+    expected = SupportStatus.UNSUPPORTED if case in ("dtype", "shape", "gqa") else SupportStatus.UNMIGRATED
     assert result.support.status is expected
+
+
+@pytest.mark.parametrize("variant", [None, "sage3_sm90", "sage3_sm100", "sage3_sm120", "sage3_sm121"])
+@pytest.mark.parametrize("kv_heads", [1, 2, 3])
+def test_sage3_capabilities_reject_head_mismatch_before_variant_gate(monkeypatch, variant, kv_heads):
+    from vllm_omni.diffusion.attention.capabilities import ExecutionContext, SupportStatus
+
+    def kernel(*args, **kwargs):
+        raise AssertionError("Capability resolution must not invoke the kernel")
+
+    module = load_sage_attn3_module(monkeypatch, kernel)
+    monkeypatch.setattr(module, "_sage3_kernel_variant", lambda q: variant)
+    impl = module.SageAttention3Impl(4, 64, 0.125)
+    q = torch.empty(1, 17, 4, 64, dtype=torch.bfloat16)
+    k = v = torch.empty(1, 17, kv_heads, 64, dtype=torch.bfloat16)
+    context = ExecutionContext(platform="cuda" if variant else "cpu")
+
+    result = impl.resolve_execution_path(context, q, k, v, None)
+
+    assert result.support.status is SupportStatus.UNSUPPORTED
+    assert "does not support GQA/MQA" in result.support.reason
+    assert f"q_heads=4, kv_heads={kv_heads}" in result.support.reason
+    assert result.requested_support(context).status is SupportStatus.UNSUPPORTED
