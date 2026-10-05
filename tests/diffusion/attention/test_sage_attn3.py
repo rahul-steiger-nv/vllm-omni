@@ -355,3 +355,29 @@ def test_sage3_capabilities_reject_head_mismatch_before_variant_gate(monkeypatch
     assert "does not support GQA/MQA" in result.support.reason
     assert f"q_heads=4, kv_heads={kv_heads}" in result.support.reason
     assert result.requested_support(context).status is SupportStatus.UNSUPPORTED
+
+
+@pytest.mark.parametrize("variant", [None, "sage3_sm100", "sage3_sm120", "sage3_sm121"])
+@pytest.mark.parametrize("head_size,runtime_head_size", [(64, 128), (128, 64), (64, 256)])
+def test_sage3_rejects_runtime_scale_mismatch(monkeypatch, variant, head_size, runtime_head_size):
+    from vllm_omni.diffusion.attention.capabilities import ExecutionContext, SupportStatus
+
+    def kernel(*args, **kwargs):
+        raise AssertionError("Sage3 must reject a scale mismatch before invoking the kernel")
+
+    module = load_sage_attn3_module(monkeypatch, kernel)
+    monkeypatch.setattr(module, "_sage3_kernel_variant", lambda q: variant)
+    scale = head_size**-0.5
+    impl = module.SageAttention3Impl(2, head_size, scale)
+    q = torch.empty(1, 17, 2, runtime_head_size, dtype=torch.bfloat16)
+    context = ExecutionContext(platform="cuda" if variant else "cpu")
+    reason = f"SAGE_ATTN_3: softmax_scale {scale} does not match head dim {runtime_head_size}."
+
+    result = impl.resolve_execution_path(context, q, q, q, None)
+
+    assert result.support.status is SupportStatus.UNSUPPORTED
+    assert result.support.reason == reason
+    assert result.requested_support(context).status is SupportStatus.UNSUPPORTED
+    with pytest.raises(ValueError) as exc_info:
+        impl.forward_cuda(q, q, q)
+    assert str(exc_info.value) == reason

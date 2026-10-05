@@ -108,6 +108,7 @@ class SageAttention3Impl(AttentionImpl):
         **extra_impl_args,
     ) -> None:
         self.causal = causal
+        self.head_size = head_size
         self.softmax_scale = softmax_scale
         self.dropout = extra_impl_args.get("dropout_p", 0.0)
         expected_scale = head_size**-0.5
@@ -158,6 +159,8 @@ class SageAttention3Impl(AttentionImpl):
                 "does not support GQA/MQA "
                 f"(q_heads={query.shape[2]}, kv_heads={key.shape[2]}). Select a GQA-capable backend."
             )
+        elif not math.isclose(self.softmax_scale, query.shape[-1] ** -0.5, rel_tol=1e-6):
+            reason = f"softmax_scale {self.softmax_scale} does not match head dim {query.shape[-1]}."
         else:
             reason = None
         if reason:
@@ -180,7 +183,6 @@ class SageAttention3Impl(AttentionImpl):
             query.shape[-1] not in (64, 128)
             or any(t.stride(-1) != 1 for t in (query, key, value))
             or (self.causal and query.shape[1] != key.shape[1])
-            or not math.isclose(self.softmax_scale, query.shape[-1] ** -0.5, rel_tol=1e-6)
         ):
             return result
         return replace(result, support=CapabilityResult.supported(), compilation_mode=CompilationMode.CUSTOM_OP)
@@ -193,6 +195,12 @@ class SageAttention3Impl(AttentionImpl):
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         _validate_sage3_metadata(attn_metadata)
+        # The constructor validates scale against head_size. An integer shape
+        # guard preserves that contract under dynamic fullgraph compilation.
+        if query.shape[-1] != self.head_size:
+            raise ValueError(
+                f"SAGE_ATTN_3: softmax_scale {self.softmax_scale} does not match head dim {query.shape[-1]}."
+            )
         query = query.transpose(1, 2).contiguous()
         key = key.transpose(1, 2).contiguous()
         value = value.transpose(1, 2).contiguous()
