@@ -274,7 +274,7 @@ def test_resolve_diffusion_od_config_prefers_getter_over_attribute():
 class BlockingVideoHandler:
     supports_mixed_reference_inputs = False
     supports_latent_mask_editing = False
-    supported_control_upload_types: frozenset[str] = frozenset()
+    supported_control_upload_types = frozenset()
 
     def __init__(self):
         self.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
@@ -676,7 +676,7 @@ def test_async_video_generation_with_audio_bypasses_base64(test_client, mocker: 
         engine.captured_sampling_params_list = sampling_params_list
         yield MockVideoResult([object()], audios=[object()], sample_rate=48000)
 
-    mocker.patch.object(engine, "generate", _generate)
+    engine.generate = _generate
 
     response = test_client.post(
         "/v1/videos",
@@ -878,7 +878,6 @@ def test_i2v_extra_params_dimensions_preserve_input_image_geometry(test_client, 
     _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
 
     engine = test_client.app.state.openai_serving_video._engine_client
-    assert engine.captured_prompt is not None
     input_image = engine.captured_prompt["multi_modal_data"]["image"]
     assert isinstance(input_image, Image.Image)
     assert input_image.size == (48, 48)
@@ -951,7 +950,6 @@ def test_magi2_i2v_preserves_reference_geometry_for_model_preprocessing(test_cli
     assert response.status_code == 200
     video_id = response.json()["id"]
     _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
-    assert engine.captured_prompt is not None
     input_image = engine.captured_prompt["multi_modal_data"]["image"]
     assert isinstance(input_image, Image.Image)
     assert input_image.size == (48, 32)
@@ -967,7 +965,6 @@ def test_magi2_serving_applies_native_defaults_and_rejects_explicit_frame_mismat
 
     asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A fox walks through snow"), "defaults"))
 
-    assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[0]
     assert (sampling.width, sampling.height) == (896, 512)
     assert sampling.num_frames == 125
@@ -1060,7 +1057,6 @@ def test_i2v_video_generation_follows_allowed_image_redirect(test_client, mocker
     assert requested_paths == ["/redirect.png", "/image.png"]
 
     engine = test_client.app.state.openai_serving_video._engine_client
-    assert engine.captured_prompt is not None
     input_image = engine.captured_prompt["multi_modal_data"]["image"]
     assert isinstance(input_image, Image.Image)
     assert input_image.size == (40, 24)
@@ -1656,7 +1652,7 @@ def test_model_reported_fps_wins_when_request_fps_omitted(test_client, mocker: M
         result.multimodal_output["fps"] = 8
         yield result
 
-    mocker.patch.object(engine, "generate", _generate)
+    engine.generate = _generate
 
     response = test_client.post("/v1/videos", data={"prompt": "source fps"})
 
@@ -1857,7 +1853,7 @@ def test_worker_fps_multiplier_is_applied_to_async_encoding(test_client, mocker:
             },
         )
 
-    mocker.patch.object(engine, "generate", _generate)
+    engine.generate = _generate
 
     def _fake_encode(video, fps, **kwargs):
         del video, kwargs
@@ -1908,7 +1904,7 @@ def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFi
 
         yield MockVideoResult([np.zeros((1, 64, 64, 3), dtype=np.uint8)], audios=[object()])
 
-    mocker.patch.object(engine, "generate", _generate)
+    engine.generate = _generate
 
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
@@ -1937,7 +1933,7 @@ def test_video_job_persists_profiler_metadata(test_client, mocker: MockerFixture
             peak_memory_mb=4096.5,
         )
 
-    mocker.patch.object(engine, "generate", _generate)
+    engine.generate = _generate
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
         return_value=b"fake-video",
@@ -2026,7 +2022,7 @@ def test_video_job_persists_action_metadata(test_client, mocker: MockerFixture):
             },
         )
 
-    mocker.patch.object(engine, "generate", _generate)
+    engine.generate = _generate
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
         return_value=b"fake-video",
@@ -2895,7 +2891,7 @@ def test_sync_t2v_returns_profiler_headers(test_client, mocker: MockerFixture):
             peak_memory_mb=1234.25,
         )
 
-    mocker.patch.object(engine, "generate", _generate)
+    engine.generate = _generate
     _mock_encode_video_bytes(mocker, b"profiled-video")
 
     response = test_client.post("/v1/videos/sync", data={"prompt": "sync profile"})
@@ -3330,7 +3326,7 @@ def test_worker_fps_multiplier_is_applied_to_sync_encoding(test_client, mocker: 
             },
         )
 
-    mocker.patch.object(engine, "generate", _generate)
+    engine.generate = _generate
 
     def _fake_encode(video, fps, **kwargs):
         del video, kwargs
