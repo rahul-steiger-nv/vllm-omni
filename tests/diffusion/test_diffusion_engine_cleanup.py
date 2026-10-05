@@ -4,6 +4,7 @@
 import asyncio
 import queue
 import threading
+import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -55,6 +56,7 @@ async def test_closing_response_stream_releases_queue(started: bool) -> None:
     request = _make_request("close-stream")
     stream = engine.async_add_req_and_stream_response(request)
     output_queue = engine._out_streams[request.request_id]
+    queue_ref = weakref.ref(output_queue)
     assert engine.scheduler.get_request_state(request.request_id) is not None
     output_queue.put_nowait(DiffusionOutput(finished=False))
     if started:
@@ -64,6 +66,9 @@ async def test_closing_response_stream_releases_queue(started: bool) -> None:
     await stream.aclose()
 
     assert request.request_id not in engine._out_streams
+    # Keeping the closed stream must not retain its queue through the callback.
+    del output_queue
+    assert queue_ref() is None
     with pytest.raises(StopAsyncIteration):
         await anext(stream)
 
@@ -117,7 +122,7 @@ async def test_close_rejected_during_iteration_keeps_queue() -> None:
     engine = _make_engine()
     request = _make_request("running")
     stream = engine.async_add_req_and_stream_response(request)
-    next_output = asyncio.create_task(anext(stream))
+    next_output: asyncio.Future[DiffusionOutput] = asyncio.ensure_future(anext(stream))
     await asyncio.sleep(0)
     try:
         with pytest.raises(RuntimeError, match="already running"):

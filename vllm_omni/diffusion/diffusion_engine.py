@@ -1192,6 +1192,7 @@ class DiffusionEngine:
         return self._add_prepared_request(request)
 
     def get_output_stream(self, request_id: str) -> AsyncGenerator[DiffusionOutput, None]:
+        """Bind a closable stream to the currently registered request queue."""
         with self._cv:
             queue = self._out_streams.get(request_id)
         if queue is None:
