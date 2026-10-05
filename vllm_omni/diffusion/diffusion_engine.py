@@ -476,7 +476,7 @@ class DiffusionEngine:
         request_id = self._add_prepared_request(request)
         generator = self.get_output_stream(request_id)
         async for output in generator:
-            output_ready_wait_time = getattr(output, "stage_durations", {}).get("output_ready_wait", 0.0)
+            output_ready_wait_time = output.output_ready_wait_time
             # The stream now materializes async outputs before yielding. Keep
             # that wait separate from execution time in the timing breakdown.
             exec_total_time = time.perf_counter() - exec_start_time - output_ready_wait_time
@@ -1158,7 +1158,7 @@ class DiffusionEngine:
                     output_ready_wait_start_time = time.perf_counter()
                     try:
                         output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
-                        output.stage_durations["output_ready_wait"] = time.perf_counter() - output_ready_wait_start_time
+                        output.output_ready_wait_time = time.perf_counter() - output_ready_wait_start_time
                     except asyncio.CancelledError:
                         # Delivery already retires completed futures; dropping
                         # them again would create an orphaned executor waiter.

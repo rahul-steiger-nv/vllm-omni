@@ -254,7 +254,7 @@ async def test_async_output_is_claimed_after_materialization() -> None:
     engine = _make_engine()
     request_id = "claimed"
     pending_output = DiffusionOutput(async_output_id="aid-claimed")
-    materialized_output = DiffusionOutput(output="materialized")
+    materialized_output = DiffusionOutput(output="materialized", stage_durations={"denoise": 1.5})
     ready: concurrent.futures.Future[DiffusionOutput] = concurrent.futures.Future()
     ready.set_result(materialized_output)
     engine.executor.wait_output_ready.return_value = ready
@@ -265,7 +265,8 @@ async def test_async_output_is_claimed_after_materialization() -> None:
     stream = engine.get_output_stream(request_id)
 
     assert await anext(stream) is materialized_output
-    assert materialized_output.stage_durations["output_ready_wait"] >= 0.0
+    assert materialized_output.output_ready_wait_time >= 0.0
+    assert materialized_output.stage_durations == {"denoise": 1.5}
     assert not engine._unclaimed_async_outputs
     engine.executor.wait_output_ready.assert_called_once_with("aid-claimed")
 

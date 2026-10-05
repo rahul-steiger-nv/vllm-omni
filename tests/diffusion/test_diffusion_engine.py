@@ -877,8 +877,7 @@ async def test_step_streaming_excludes_output_wait_from_execution_time(
 ) -> None:
     clock = [0.0]
     mocker.patch.object(diffusion_engine_module.time, "perf_counter", side_effect=lambda: clock[0])
-    stage_durations = {"output_ready_wait": output_wait} if output_wait else {}
-    output = DiffusionOutput(stage_durations=stage_durations)
+    output = DiffusionOutput(stage_durations={"denoise": 10.0}, output_ready_wait_time=output_wait)
     formatted_output = SimpleNamespace(metrics={})
     request = SimpleNamespace(scheduler_queue_wait_ms=None)
 
