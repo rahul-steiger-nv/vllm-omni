@@ -107,8 +107,9 @@ async def test_unstarted_stream_does_not_admit_request() -> None:
 async def test_closing_stream_discards_unclaimed_async_output() -> None:
     engine = _make_engine()
     request_id = "abandoned"
-    engine._out_streams[request_id] = asyncio.Queue()
-    engine._unclaimed_async_outputs[request_id] = {"aid-queued"}
+    output_queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+    engine._out_streams[request_id] = output_queue
+    engine._unclaimed_async_outputs[output_queue] = {"aid-queued"}
     stream = engine.get_output_stream(request_id)
     next_output = asyncio.create_task(anext(stream))
     await asyncio.sleep(0)
@@ -119,7 +120,43 @@ async def test_closing_stream_discards_unclaimed_async_output() -> None:
 
     engine.executor.drop_output.assert_called_once_with("aid-queued")
     assert request_id not in engine._out_streams
-    assert request_id not in engine._unclaimed_async_outputs
+    assert not engine._unclaimed_async_outputs
+
+
+@pytest.mark.asyncio
+async def test_old_stream_cleanup_preserves_reused_request_outputs() -> None:
+    engine = _make_engine()
+    engine.main_loop = None
+    request_id = "reused"
+    old_queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+    engine._out_streams[request_id] = old_queue
+    engine._put_output(request_id, DiffusionOutput(finished=True))
+    old_stream = engine.get_output_stream(request_id)
+    await anext(old_stream)
+    # Leave an unclaimed output owned by the old stream to exercise cleanup.
+    engine._put_output(request_id, DiffusionOutput(async_output_id="aid-old"))
+
+    new_queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+    engine._out_streams[request_id] = new_queue
+    engine._put_output(request_id, DiffusionOutput(async_output_id="aid-new"))
+
+    await old_stream.aclose()
+
+    engine.executor.drop_output.assert_called_once_with("aid-old")
+    assert engine._out_streams[request_id] is new_queue
+    assert engine._unclaimed_async_outputs == {new_queue: {"aid-new"}}
+
+    materialized_output = DiffusionOutput(output="new", finished=True)
+    ready: concurrent.futures.Future[DiffusionOutput] = concurrent.futures.Future()
+    ready.set_result(materialized_output)
+    engine.executor.wait_output_ready.return_value = ready
+    new_stream = engine.get_output_stream(request_id)
+    assert await anext(new_stream) is materialized_output
+    engine.executor.wait_output_ready.assert_called_once_with("aid-new")
+    await new_stream.aclose()
+    assert not engine._out_streams
+    assert not engine._unclaimed_async_outputs
+    engine.executor.drop_output.assert_called_once_with("aid-old")
 
 
 @pytest.mark.asyncio
@@ -134,12 +171,12 @@ async def test_async_output_is_claimed_after_materialization() -> None:
     output_queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
     output_queue.put_nowait(pending_output)
     engine._out_streams[request_id] = output_queue
-    engine._unclaimed_async_outputs[request_id] = {"aid-claimed"}
+    engine._unclaimed_async_outputs[output_queue] = {"aid-claimed"}
     stream = engine.get_output_stream(request_id)
 
     assert await anext(stream) is materialized_output
     assert materialized_output.stage_durations["output_ready_wait"] >= 0.0
-    assert request_id not in engine._unclaimed_async_outputs
+    assert not engine._unclaimed_async_outputs
     engine.executor.wait_output_ready.assert_called_once_with("aid-claimed")
 
     await stream.aclose()
@@ -156,7 +193,7 @@ async def test_exceptional_materialization_retires_async_output() -> None:
     output_queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
     output_queue.put_nowait(DiffusionOutput(async_output_id=async_output_id))
     engine._out_streams[request_id] = output_queue
-    engine._unclaimed_async_outputs[request_id] = {async_output_id}
+    engine._unclaimed_async_outputs[output_queue] = {async_output_id}
     stream = engine.get_output_stream(request_id)
     next_output = asyncio.create_task(anext(stream))
     await asyncio.sleep(0)
@@ -170,7 +207,7 @@ async def test_exceptional_materialization_retires_async_output() -> None:
 
     assert executor._output_futures == {}
     assert executor._completed_outputs == {}
-    assert request_id not in engine._unclaimed_async_outputs
+    assert not engine._unclaimed_async_outputs
 
 
 @pytest.mark.asyncio
@@ -186,7 +223,7 @@ async def test_cancelling_materialization_discards_async_output(running: bool) -
     output_queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
     output_queue.put_nowait(pending_output)
     engine._out_streams[request_id] = output_queue
-    engine._unclaimed_async_outputs[request_id] = {"aid-cancelled"}
+    engine._unclaimed_async_outputs[output_queue] = {"aid-cancelled"}
     stream = engine.get_output_stream(request_id)
     next_output = asyncio.create_task(anext(stream))
     await asyncio.sleep(0)
@@ -203,7 +240,7 @@ async def test_cancelling_materialization_discards_async_output(running: bool) -
         engine.executor.drop_output.assert_not_called()
         assert ready.cancelled()
     assert request_id not in engine._out_streams
-    assert request_id not in engine._unclaimed_async_outputs
+    assert not engine._unclaimed_async_outputs
 
 
 @pytest.mark.asyncio
@@ -217,7 +254,7 @@ async def test_cancellation_after_delivery_does_not_recreate_waiter(failed: bool
     output_queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
     output_queue.put_nowait(DiffusionOutput(async_output_id=async_output_id))
     engine._out_streams[request_id] = output_queue
-    engine._unclaimed_async_outputs[request_id] = {async_output_id}
+    engine._unclaimed_async_outputs[output_queue] = {async_output_id}
     stream = engine.get_output_stream(request_id)
     next_output = asyncio.create_task(anext(stream))
     await asyncio.sleep(0)
@@ -237,7 +274,7 @@ async def test_cancellation_after_delivery_does_not_recreate_waiter(failed: bool
     assert executor._output_futures == {}
     assert executor._completed_outputs == {}
     assert request_id not in engine._out_streams
-    assert request_id not in engine._unclaimed_async_outputs
+    assert not engine._unclaimed_async_outputs
 
 
 def test_emit_finished_outputs_finalizes_already_drained_waiter() -> None:

@@ -409,7 +409,8 @@ class DiffusionEngine:
         self._rpc_lock = threading.RLock()
         self._cv = threading.Condition(self._rpc_lock)
         self._out_streams: dict[str, asyncio.Queue[DiffusionOutput]] = {}
-        self._unclaimed_async_outputs: dict[str, set[str]] = {}
+        # Track ownership by stream because request IDs can be reused.
+        self._unclaimed_async_outputs: dict[asyncio.Queue[DiffusionOutput], set[str]] = {}
         self._closed = False
         self._shutting_down = False
         self._shutdown_complete = False
@@ -1177,11 +1178,11 @@ class DiffusionEngine:
                         raise
                     finally:
                         with self._cv:
-                            pending_ids = self._unclaimed_async_outputs.get(request_id)
+                            pending_ids = self._unclaimed_async_outputs.get(queue)
                             if pending_ids is not None:
                                 pending_ids.discard(async_output_id)
                                 if not pending_ids:
-                                    self._unclaimed_async_outputs.pop(request_id, None)
+                                    self._unclaimed_async_outputs.pop(queue, None)
                 yield output
                 if output.finished:
                     break
@@ -1192,7 +1193,7 @@ class DiffusionEngine:
             with self._cv:
                 if self._out_streams.get(request_id) is queue:
                     self._out_streams.pop(request_id, None)
-                abandoned_ids = self._unclaimed_async_outputs.pop(request_id, set())
+                abandoned_ids = self._unclaimed_async_outputs.pop(queue, set())
             for async_output_id in abandoned_ids:
                 self.executor.drop_output(async_output_id)
 
@@ -1576,7 +1577,7 @@ class DiffusionEngine:
         with self._cv:
             queue = self._out_streams.get(request_id)
             if queue is not None and async_output_id is not None:
-                self._unclaimed_async_outputs.setdefault(request_id, set()).add(async_output_id)
+                self._unclaimed_async_outputs.setdefault(queue, set()).add(async_output_id)
         if queue is None:
             if async_output_id is not None:
                 self.executor.drop_output(async_output_id)
