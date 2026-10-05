@@ -48,6 +48,89 @@ def _make_engine() -> DiffusionEngine:
     return engine
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("started", [False, True])
+async def test_closing_response_stream_releases_queue(started: bool) -> None:
+    engine = _make_engine()
+    request = _make_request("close-stream")
+    stream = engine.async_add_req_and_stream_response(request)
+    output_queue = engine._out_streams[request.request_id]
+    assert engine.scheduler.get_request_state(request.request_id) is not None
+    output_queue.put_nowait(DiffusionOutput(finished=False))
+    if started:
+        await anext(stream)
+
+    await stream.aclose()
+    await stream.aclose()
+
+    assert request.request_id not in engine._out_streams
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+
+
+@pytest.mark.asyncio
+async def test_unstarted_stream_close_preserves_reused_request_queue() -> None:
+    engine = _make_engine()
+    request = _make_request("reused")
+    stream = engine.async_add_req_and_stream_response(request)
+    replacement: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+    engine._out_streams[request.request_id] = replacement
+
+    await stream.aclose()
+
+    assert engine._out_streams[request.request_id] is replacement
+
+
+@pytest.mark.asyncio
+async def test_delayed_stream_iteration_uses_original_queue() -> None:
+    engine = _make_engine()
+    request = _make_request("reused")
+    stream = engine.async_add_req_and_stream_response(request)
+    original_output = DiffusionOutput(output="original", finished=True)
+    engine._out_streams[request.request_id].put_nowait(original_output)
+    replacement: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+    replacement_output = DiffusionOutput(output="replacement", finished=True)
+    replacement.put_nowait(replacement_output)
+    engine._out_streams[request.request_id] = replacement
+
+    assert await anext(stream) is original_output
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+    assert engine._out_streams[request.request_id] is replacement
+    assert replacement.get_nowait() is replacement_output
+
+
+@pytest.mark.asyncio
+async def test_throw_into_unstarted_stream_releases_queue() -> None:
+    engine = _make_engine()
+    request = _make_request("throw-before-start")
+    stream = engine.async_add_req_and_stream_response(request)
+
+    with pytest.raises(RuntimeError, match="caller failed"):
+        await stream.athrow(RuntimeError("caller failed"))
+
+    assert request.request_id not in engine._out_streams
+
+
+@pytest.mark.asyncio
+async def test_close_rejected_during_iteration_keeps_queue() -> None:
+    engine = _make_engine()
+    request = _make_request("running")
+    stream = engine.async_add_req_and_stream_response(request)
+    next_output = asyncio.create_task(anext(stream))
+    await asyncio.sleep(0)
+    try:
+        with pytest.raises(RuntimeError, match="already running"):
+            await stream.aclose()
+        assert request.request_id in engine._out_streams
+    finally:
+        next_output.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await next_output
+        await stream.aclose()
+    assert request.request_id not in engine._out_streams
+
+
 def test_close_completes_pending_output_streams() -> None:
     engine = _make_engine()
     event_loop = asyncio.new_event_loop()
