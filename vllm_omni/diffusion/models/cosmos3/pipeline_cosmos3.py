@@ -738,9 +738,9 @@ def to_display_uint8(video: torch.Tensor, *, guardrails_enabled: bool = False) -
 
 
 def _video_output_type(sampling_params) -> str:
-    explicit = getattr(sampling_params, "output_type", None)
-    if explicit is not None:
-        return explicit
+    # Sampling/stage output_type historically did not select the Cosmos3
+    # postprocessor's presentation. Keep NumPy unless the server opts into
+    # display bytes for encoding via its internal transport signal.
     return "uint8" if getattr(sampling_params, "prefer_video_uint8", False) else "np"
 
 

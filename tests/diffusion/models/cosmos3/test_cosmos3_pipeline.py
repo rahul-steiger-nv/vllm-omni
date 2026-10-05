@@ -1606,6 +1606,7 @@ def test_forward_narrows_using_request_guardrail_setting(
         height=16,
         width=16,
         output_type="uint8",
+        prefer_video_uint8=True,
         extra_args={"guardrails": guardrails_enabled},
     )
     calls = []
@@ -1648,7 +1649,7 @@ def test_forward_keeps_float_video_when_device_conversion_is_disabled(
         pipeline_cosmos3, "to_display_uint8", lambda *args, **kwargs: pytest.fail("device conversion must be skipped")
     )
     sp = make_sampling_params(
-        guidance_scale=1.0, num_inference_steps=1, num_frames=5, height=16, width=16, output_type="uint8"
+        guidance_scale=1.0, num_inference_steps=1, num_frames=5, height=16, width=16, prefer_video_uint8=True
     )
     request = make_request_batch({"prompt": "A test video.", "modalities": ["video"]}, sp)
 
@@ -1702,7 +1703,7 @@ def test_forward_device_conversion_oom_preserves_float_video(
     monkeypatch.setattr(pipeline_cosmos3.current_omni_platform, "empty_cache", empty_cache)
     monkeypatch.setattr(pipeline_cosmos3.current_omni_platform, "synchronize", lambda: cleanup.append("synchronize"))
     sp = make_sampling_params(
-        guidance_scale=1.0, num_inference_steps=1, num_frames=5, height=16, width=16, output_type="uint8"
+        guidance_scale=1.0, num_inference_steps=1, num_frames=5, height=16, width=16, prefer_video_uint8=True
     )
     request = make_request_batch({"prompt": "A test video.", "modalities": ["video"]}, sp)
     if failure == "unrelated_error":
@@ -3491,42 +3492,40 @@ class TestForwardRouting:
             pipeline.forward(make_request_batch(prompt, sampling_params))
 
 
-@pytest.mark.parametrize("output_type", [None, "np", "pt", "pil"])
+@pytest.mark.parametrize("output_type", [None, "np", "pt", "pil", "latent", "uint8"])
 @pytest.mark.parametrize("enable_cpu_offload", [False, True])
-def test_video_output_preserves_float_values(output_type, enable_cpu_offload):
+def test_sampling_output_type_preserves_legacy_numpy_output(output_type, enable_cpu_offload):
     from diffusers.video_processor import VideoProcessor
 
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
         _should_narrow_video_output,
+        _video_output_type,
         get_cosmos3_post_process_func,
-        to_display_uint8,
     )
 
     video = torch.linspace(-1, 1, 90).reshape(1, 3, 2, 3, 5)
     video[..., 0, 0] = 0  # Must remain exactly 0.5 for floating outputs.
+    params = SimpleNamespace(output_type=output_type)
+    resolved = _video_output_type(params)
+    assert resolved == "np"
     narrow = _should_narrow_video_output(
         is_output_rank=True,
         is_t2i=False,
         enable_cpu_offload=enable_cpu_offload,
-        output_type=output_type or "np",
+        output_type=resolved,
     )
-    assert narrow == (output_type == "pil" and not enable_cpu_offload)
-    payload = to_display_uint8(video) if narrow else video
+    assert not narrow
     postprocess = get_cosmos3_post_process_func(SimpleNamespace())
-    actual = postprocess({"video": payload}, sampling_params=SimpleNamespace(output_type=output_type))
-    expected = VideoProcessor(vae_scale_factor=16).postprocess_video(video, output_type=output_type or "np")
-    if output_type == "pt":
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    elif output_type == "pil":
-        for actual_frame, expected_frame in zip(actual[0], expected[0]):
-            np.testing.assert_array_equal(np.asarray(actual_frame), np.asarray(expected_frame))
-    else:
-        np.testing.assert_array_equal(actual, expected)
+    actual = postprocess({"video": video}, sampling_params=params)
+    expected = VideoProcessor(vae_scale_factor=16).postprocess_video(video, output_type="np")
+    assert isinstance(actual, np.ndarray)
+    assert actual.dtype == np.float32
+    np.testing.assert_array_equal(actual, expected)
 
 
 @pytest.mark.parametrize("offload", [False, True])
-@pytest.mark.parametrize("output_type", [None, "np", "pt", "pil"])
-def test_encoded_video_preference_preserves_explicit_output_contract(output_type, offload):
+@pytest.mark.parametrize("output_type", [None, "np", "pt", "pil", "latent", "uint8"])
+def test_encoded_video_preference_uses_internal_signal(output_type, offload):
     from diffusers.video_processor import VideoProcessor
 
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
@@ -3538,23 +3537,15 @@ def test_encoded_video_preference_preserves_explicit_output_contract(output_type
 
     params = SimpleNamespace(output_type=output_type, prefer_video_uint8=True)
     resolved = _video_output_type(params)
-    assert resolved == (output_type or "uint8")
+    assert resolved == "uint8"
     video = torch.linspace(-1, 1, 90).reshape(1, 3, 2, 3, 5)
     video[..., 0, 0] = 0
     narrow = _should_narrow_video_output(
         is_output_rank=True, is_t2i=False, enable_cpu_offload=offload, output_type=resolved
     )
-    assert narrow == (output_type in (None, "pil") and not offload)
+    assert narrow == (not offload)
     payload = to_display_uint8(video) if narrow else video
     actual = get_cosmos3_post_process_func(SimpleNamespace())({"video": payload}, sampling_params=params)
-    reference = VideoProcessor(vae_scale_factor=16).postprocess_video(video, output_type=output_type or "np")
-    if output_type is None:
-        assert actual.dtype == np.uint8
-        np.testing.assert_array_equal(actual, np.round(reference * 255).astype(np.uint8))
-    elif output_type == "pt":
-        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
-    elif output_type == "pil":
-        for frame, expected in zip(actual[0], reference[0]):
-            np.testing.assert_array_equal(np.asarray(frame), np.asarray(expected))
-    else:
-        np.testing.assert_array_equal(actual, reference)
+    reference = VideoProcessor(vae_scale_factor=16).postprocess_video(video, output_type="np")
+    assert actual.dtype == np.uint8
+    np.testing.assert_array_equal(actual, np.round(reference * 255).astype(np.uint8))

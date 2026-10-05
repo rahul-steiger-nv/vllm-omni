@@ -215,9 +215,9 @@ class OmniDiffusionSamplingParams:
     prompt_template: dict[str, Any] | None = None
     do_classifier_free_guidance: bool = False
     output_type: str | None = None
-    # Encoded-video consumers can accept display-ready uint8 frames. Pipelines
-    # may honor this preference when output_type is unset; explicit np/pt
-    # requests retain their floating-point contract.
+    # Internal signal from encoded-video consumers that accept display-ready
+    # uint8 frames. Pipelines resolve this transport preference while preserving
+    # their historical handling of sampling output_type.
     prefer_video_uint8: bool = False
 
     # Request-scoped quality intent. ``None`` delegates the default behavior
