@@ -918,7 +918,6 @@ def test_video_generation_bridges_request_fields(generation_request, expected_nu
 
     assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[0]
-    assert sampling.prefer_video_uint8 is True
     # Top-level ``seconds`` bridges into extra_args["duration"]; num_frames is
     # passed through (or derived as seconds x fps when omitted). No private
     # provenance channel is injected.

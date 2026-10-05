@@ -19,20 +19,16 @@ from vllm_omni.diffusion.models.cosmos3 import guardrails
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
-@pytest.mark.parametrize("chunk_bytes", [1, 64 << 20])
 @pytest.mark.parametrize("modify_frames", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_display_conversion_preserves_guardrail_input_and_output_bytes(
-    monkeypatch: pytest.MonkeyPatch, chunk_bytes: int, modify_frames: bool, dtype: torch.dtype, device: str
+def test_float_guardrails_preserve_input_and_modified_output_bytes(
+    monkeypatch: pytest.MonkeyPatch, modify_frames: bool, dtype: torch.dtype, device: str
 ) -> None:
     from diffusers.video_processor import VideoProcessor
 
-    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
-
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
-    monkeypatch.setattr(pipeline_cosmos3, "_DISPLAY_CHUNK_BYTES", chunk_bytes)
     # Include bf16 rounding boundaries, saturation, and both ends of the range.
     values = torch.tensor([-1.4, -1, -0.50390625, 0, 0.50390625, 1, 1.4], dtype=dtype)
     video = values.view(1, 1, 7, 1, 1).expand(1, 3, 7, 2, 2).clone().to(device)
@@ -48,76 +44,24 @@ def test_display_conversion_preserves_guardrail_input_and_output_bytes(
         return frames
 
     monkeypatch.setattr(guardrails, "_video_guardrail", check)
-    old_checked = guardrails.check_video_safety(video)
-    reference = VideoProcessor(vae_scale_factor=16).postprocess_video(old_checked, output_type="np")
-    expected = np.round(np.clip(reference, 0, 1) * 255).astype(np.uint8)
-
-    narrowed = pipeline_cosmos3.to_display_uint8(video, guardrails_enabled=True)
-    checked = guardrails.check_video_safety(narrowed)
-
-    assert np.array_equal(captured[0], captured[1])
-    assert np.array_equal(checked.cpu().numpy(), expected)
+    checked = guardrails.check_video_safety(video)
+    float_video = video[0].detach().cpu().float().clamp(-1, 1)
+    expected_input = ((float_video * 0.5 + 0.5).permute(1, 2, 3, 0).numpy() * 255).round().astype(np.uint8)
+    np.testing.assert_array_equal(captured[0], expected_input)
+    expected_output = (
+        np.arange(256 * 3, dtype=np.int64).astype(np.uint8).reshape(1, 16, 16, 3) if modify_frames else expected_input
+    )
+    displayed = VideoProcessor(vae_scale_factor=16).postprocess_video(checked, output_type="np")
+    np.testing.assert_array_equal(np.round(displayed[0] * 255).astype(np.uint8), expected_output)
+    assert checked.dtype == torch.float32
+    assert checked.device == video.device
     assert torch.equal(video, original)
-    if dtype == torch.bfloat16:
-        assert not torch.equal(narrowed, pipeline_cosmos3.to_display_uint8(video))
 
 
 def test_check_video_safety_is_a_no_op_when_no_guardrail_is_loaded() -> None:
-    frames = torch.zeros(1, 2, 4, 4, 3, dtype=torch.uint8)
+    frames = torch.zeros(1, 3, 2, 4, 4)
 
     assert guardrails.check_video_safety(frames) is frames
-
-
-def test_check_video_safety_skips_conversions_for_display_frames(monkeypatch: pytest.MonkeyPatch) -> None:
-    """uint8 channel-last frames are already the guardrail's own format.
-
-    The float path has to denormalize, scale, round and permute on the way in and
-    undo all of it on the way out. Frames that arrive display-ready skip both.
-    """
-    seen: list[np.ndarray] = []
-
-    def _guardrail(frames: np.ndarray) -> np.ndarray:
-        seen.append(frames)
-        return frames
-
-    monkeypatch.setattr(guardrails, "_video_guardrail", _guardrail)
-    frames = torch.arange(2 * 4 * 4 * 3, dtype=torch.uint8).reshape(1, 2, 4, 4, 3)
-
-    checked = guardrails.check_video_safety(frames)
-
-    assert len(seen) == 1
-    assert seen[0].dtype == np.uint8
-    assert seen[0].shape == (2, 4, 4, 3)
-    assert checked.dtype == torch.uint8
-    assert torch.equal(checked, frames)
-
-
-def test_check_video_safety_accepts_unbatched_display_frames(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(guardrails, "_video_guardrail", lambda frames: frames)
-    frames = torch.arange(2 * 4 * 4 * 3, dtype=torch.uint8).reshape(2, 4, 4, 3)
-
-    checked = guardrails.check_video_safety(frames)
-
-    assert checked.shape == frames.shape
-    assert torch.equal(checked, frames)
-
-
-@pytest.mark.parametrize(
-    ("frames", "message"),
-    [
-        (torch.zeros(1, 2, 4, 4, 4, dtype=torch.uint8), "display-frame guardrails expect"),
-        (torch.zeros(2, 2, 4, 4, 3, dtype=torch.uint8), "one video per request"),
-    ],
-)
-def test_check_video_safety_validates_display_frame_contract(
-    monkeypatch: pytest.MonkeyPatch,
-    frames: torch.Tensor,
-    message: str,
-) -> None:
-    monkeypatch.setattr(guardrails, "_video_guardrail", lambda value: value)
-
-    with pytest.raises(ValueError, match=message):
-        guardrails.check_video_safety(frames)
 
 
 def test_check_video_safety_still_round_trips_the_vae_range(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -133,7 +77,7 @@ def test_check_video_safety_still_round_trips_the_vae_range(monkeypatch: pytest.
 
     checked = guardrails.check_video_safety(video)
 
-    # The guardrail sees uint8 channel-last either way; only the wrapping differs.
+    # The classifier receives display bytes; the adapter returns normalized floats.
     assert captured[0].dtype == np.uint8
     assert captured[0].shape == (2, 4, 4, 3)
     assert checked.shape == video.shape

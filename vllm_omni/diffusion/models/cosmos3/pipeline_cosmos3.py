@@ -56,6 +56,14 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.media import (
+    DiffusionMediaOutput,
+    VideoMediaOutput,
+    VideoTensorEncoding,
+    VideoTensorLayout,
+    VideoTensorSpec,
+    VideoValueRange,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
     ReferenceVideoDecodeSpec,
@@ -83,7 +91,6 @@ from vllm_omni.experimental.world_models.session_state import (
     resolve_session_state_config,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.platforms import current_omni_platform
 
 from .action import (
     ACTION_MODE_FORWARD_DYNAMICS,
@@ -683,105 +690,57 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
     return pre_process_func
 
 
-# Bound the temporary float32 conversion immediately after VAE decode.
-_DISPLAY_CHUNK_BYTES = 64 << 20
-
-
-def _display_chunk_frame_count(video: torch.Tensor, chunk_bytes: int | None = None) -> int:
-    """Return the max frames per slice that stay within the intermediate-byte budget (always >= 1)."""
-    if video.ndim != 5:
-        raise ValueError(f"Expected decoded video with shape [B, C, T, H, W], got {tuple(video.shape)}.")
-    if chunk_bytes is None:
-        chunk_bytes = _DISPLAY_CHUNK_BYTES
-    batch, channels, _, height, width = video.shape
-    # Non-float32 inputs briefly coexist with their float32 form during the
-    # cast that precedes scaling to display bytes.
-    bytes_per_value = 4 if video.dtype == torch.float32 else video.element_size() + 4
-    intermediate_bytes_per_frame = batch * height * width * channels * bytes_per_value
-    return max(1, chunk_bytes // intermediate_bytes_per_frame)
-
-
-def to_display_uint8(video: torch.Tensor, *, guardrails_enabled: bool = False) -> torch.Tensor:
-    """Convert a decoded video from VAE range to display-ready uint8 frames.
-
-    The VAE emits ``[B, C, T, H, W]`` in ``[-1, 1]``; every consumer ultimately
-    wants ``[B, T, H, W, C]`` uint8 in ``[0, 255]``. Narrowing before IPC
-    reduces the device-to-host and shared-memory payload.
-
-    Without guardrails, denormalization preserves the decode dtype to match
-    historical ``VideoProcessor`` bytes. With guardrails, cast to float32 first
-    and clamp before denormalization to match the historical guardrail input.
-    Both paths scale and round in float32, with chunked intermediates.
-    """
-    video = video.detach()
-    batch, channels, frames, height, width = video.shape
-    out = torch.empty(
-        (batch, frames, height, width, channels),
-        dtype=torch.uint8,
-        device=video.device,
-    )
-
-    step = _display_chunk_frame_count(video)
-    for start in range(0, frames, step):
-        stop = min(start + step, frames)
-        # Guardrails historically denormalized in float32; VideoProcessor used
-        # the decode dtype. Preserve both paths' bytes before narrowing for IPC.
-        dtype = torch.float32 if guardrails_enabled else video.dtype
-        chunk = video[:, :, start:stop].permute(0, 2, 3, 4, 1).to(dtype, copy=True)
-        if guardrails_enabled:
-            chunk.clamp_(-1, 1)
-        chunk = chunk.mul_(0.5).add_(0.5).clamp_(0, 1)
-        if chunk.dtype != torch.float32:
-            chunk = chunk.float()
-        out[:, start:stop] = chunk.mul_(255).round_().to(torch.uint8)
-    return out
-
-
-def _video_output_type(sampling_params) -> str:
-    # Sampling/stage output_type historically did not select the Cosmos3
-    # postprocessor's presentation. Keep NumPy unless the server opts into
-    # display bytes for encoding via its internal transport signal.
-    return "uint8" if getattr(sampling_params, "prefer_video_uint8", False) else "np"
-
-
-def _should_narrow_video_output(
+def _cosmos3_media_output(
+    output: dict[str, Any],
+    od_config: OmniDiffusionConfig,
+    sampling_params: OmniDiffusionSamplingParams,
     *,
-    is_output_rank: bool,
-    is_t2i: bool,
-    enable_cpu_offload: bool,
-    output_type: str = "np",
-    enable_device_postprocess: bool = True,
-    enable_layerwise_offload: bool = False,
-    enable_distributed_layerwise_offload: bool = False,
-) -> bool:
-    """Narrow only byte-consuming output with GPU post-decode headroom."""
-    return (
-        is_output_rank
-        and not is_t2i
-        and enable_device_postprocess
-        and not enable_cpu_offload
-        and not enable_layerwise_offload
-        and not enable_distributed_layerwise_offload
-        and output_type in ("pil", "uint8")
-    )
+    stage_durations: dict[str, float] | None = None,
+) -> DiffusionOutput:
+    """Use shared transport only for plain video with NumPy presentation.
 
+    Guardrails and auxiliary outputs retain the existing model postprocessor.
+    Sampling output_type historically did not change Cosmos3 presentation, so
+    non-NumPy requests also stay on that path rather than changing their API.
+    """
+    from .guardrails import is_guardrails_enabled
 
-def _display_uint8_to_pil(video: torch.Tensor) -> list[list[PIL.Image.Image]]:
-    """Convert ``[B, T, H, W, C]`` display bytes to PIL one frame at a time."""
-    if video.ndim != 5 or video.shape[-1] not in (1, 3, 4):
-        raise ValueError(
-            f"Expected display video with shape [B, T, H, W, C] and 1, 3, or 4 channels, got {tuple(video.shape)}."
+    video = output.get("video")
+    if (
+        not _is_rank_zero()
+        or set(output) != {"video"}
+        or video is None
+        or video.ndim != 5
+        or is_guardrails_enabled(od_config, sampling_params)
+        or (sampling_params.output_type or "np") != "np"
+        or any(
+            getattr(od_config, flag, False)
+            for flag in ("enable_cpu_offload", "enable_layerwise_offload", "enable_distributed_layerwise_offload")
         )
-    return [[PIL.Image.fromarray(frame.detach().cpu().numpy()) for frame in sample] for sample in video]
+    ):
+        return DiffusionOutput(output=output, stage_durations=stage_durations)
+    return DiffusionOutput(
+        media=DiffusionMediaOutput(
+            video=VideoMediaOutput(
+                tensor=video,
+                spec=VideoTensorSpec(
+                    layout=VideoTensorLayout.BCTHW,
+                    encoding=VideoTensorEncoding.NORMALIZED_FLOAT,
+                    value_range=VideoValueRange.NEGATIVE_ONE_TO_ONE,
+                    preserve_input_dtype=True,
+                ),
+            ),
+        ),
+        stage_durations=stage_durations,
+    )
 
 
 def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
     """Build the postprocessor for Cosmos3 image, video, and video+audio output.
 
-    The pipeline returns image payloads as ``{"image": tensor}`` and video
-    payloads as ``{"video": tensor}``. Sound-enabled video returns the same
-    video payload plus ``audio`` and ``audio_sample_rate``. Image output with
-    audio is rejected because Cosmos3 sound generation is video-only.
+    Guarded video, images, and video with audio/actions or transfer metadata
+    retain the legacy payload and model postprocessing. Plain video uses the
+    shared media finalizer. Image output with audio is rejected.
     """
     from .guardrails import check_video_safety, is_guardrails_enabled
 
@@ -811,11 +770,9 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
 
     def post_process_func(
         output: torch.Tensor | dict[str, torch.Tensor] | tuple,
-        output_type: str | None = None,
+        output_type: str = "np",
         sampling_params=None,
     ):
-        if output_type is None:
-            output_type = _video_output_type(sampling_params)
         if output_type == "latent":
             return output
 
@@ -895,33 +852,10 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
                     "metadata": envelope_public_metadata,
                 }
             return processed_image
-        # Device conversion may have been disabled or failed with OOM. Finish
-        # byte conversion on the host, even for small payloads that bypass D2H.
-        if output_type == "uint8" and video.dtype != torch.uint8:
-            video = video.detach().cpu()
         guardrails_enabled = is_guardrails_enabled(od_config, sampling_params)
         if guardrails_enabled:
             video = check_video_safety(video)
-        if output_type == "uint8":
-            # CPU offload leaves narrowing to postprocess. Both paths return
-            # the same display bytes in [B, T, H, W, C] for the video encoder.
-            if video.dtype != torch.uint8:
-                video = to_display_uint8(video)
-            processed_video = video.detach().cpu().numpy()
-        elif video.dtype == torch.uint8:
-            # The uint8 channel-last representation is an internal transport
-            # optimization. Restore the public VideoProcessor contracts here.
-            if output_type == "pt":
-                processed_video = video.permute(0, 1, 4, 2, 3).float().div_(255.0)
-            elif output_type == "np":
-                processed_video = video.detach().cpu().numpy().astype(np.float32)
-                processed_video /= 255.0
-            elif output_type == "pil":
-                processed_video = _display_uint8_to_pil(video)
-            else:
-                raise ValueError(f"Unsupported Cosmos3 video output_type: {output_type!r}.")
-        else:
-            processed_video = video_processor.postprocess_video(video, output_type=output_type)
+        processed_video = video_processor.postprocess_video(video, output_type=output_type)
         if audio is None:
             if pending_action is not None:
                 return {
@@ -4247,35 +4181,6 @@ class Cosmos3OmniDiffusersPipeline(
             logger.info("Decoding video...")
         decode_start = time.time()
         video = self._decode_latents(latents)
-        if _should_narrow_video_output(
-            is_output_rank=_is_rank_zero(),
-            is_t2i=is_t2i,
-            enable_cpu_offload=bool(getattr(self.od_config, "enable_cpu_offload", False)),
-            output_type=_video_output_type(sp),
-            enable_device_postprocess=bool(
-                getattr(getattr(self.od_config, "video_output_transport", None), "enable_device_postprocess", False)
-            ),
-            enable_layerwise_offload=bool(getattr(self.od_config, "enable_layerwise_offload", False)),
-            enable_distributed_layerwise_offload=bool(
-                getattr(self.od_config, "enable_distributed_layerwise_offload", False)
-            ),
-        ):
-            # T2I keeps the VAE range because its postprocess hands back PIL
-            # images. Offload keeps conversion on the host to preserve the
-            # post-decode memory headroom it was enabled to provide.
-            from .guardrails import is_guardrails_enabled
-
-            conversion_oom = False
-            try:
-                video = to_display_uint8(video, guardrails_enabled=is_guardrails_enabled(self.od_config, sp))
-            except torch.OutOfMemoryError:
-                logger.warning("Cosmos3 device video conversion ran out of memory; using float transport")
-                conversion_oom = True
-            if conversion_oom:
-                # Release the exception traceback and its conversion buffers
-                # before allocator cleanup, retaining the original VAE tensor.
-                current_omni_platform.empty_cache()
-                current_omni_platform.synchronize()
         if _is_rank_zero():
             logger.info("Video decoded in %.2fs", time.time() - decode_start)
             if not sound_enabled:
@@ -4317,7 +4222,9 @@ class Cosmos3OmniDiffusersPipeline(
                 stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             )
 
-        return DiffusionOutput(
+        return _cosmos3_media_output(
             output={"image": video} if is_t2i else {"video": video},
+            od_config=self.od_config,
+            sampling_params=sp,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
