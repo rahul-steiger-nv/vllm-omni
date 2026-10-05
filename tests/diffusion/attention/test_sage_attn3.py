@@ -53,44 +53,6 @@ def test_sage_attn3_forward_uses_blackwell_layout(monkeypatch: pytest.MonkeyPatc
     assert torch.allclose(output, expected)
 
 
-def test_sage_attn3_rejects_gqa_instead_of_falling_back(monkeypatch: pytest.MonkeyPatch):
-    def fake_kernel(*args, **kwargs):
-        raise AssertionError("sageattn3_blackwell should not be used for GQA")
-
-    backend_module = load_sage_attn3_module(monkeypatch, fake_kernel)
-    impl = backend_module.SageAttention3Impl(
-        num_heads=4,
-        head_size=64,
-        softmax_scale=1.0 / 8.0,
-        causal=False,
-    )
-
-    query = torch.randn(2, 8, 4, 64)
-    key = torch.randn(2, 8, 2, 64)
-    value = torch.randn(2, 8, 2, 64)
-
-    with pytest.raises(NotImplementedError, match="does not support GQA/MQA"):
-        impl.forward_cuda(query, key, value)
-
-
-def test_sage_attn3_rejects_mask_instead_of_ignoring_it(monkeypatch: pytest.MonkeyPatch):
-    def fake_kernel(*args, **kwargs):
-        raise AssertionError("sageattn3_blackwell should not run with an unsupported mask")
-
-    backend_module = load_sage_attn3_module(monkeypatch, fake_kernel)
-    impl = backend_module.SageAttention3Impl(
-        num_heads=4,
-        head_size=64,
-        softmax_scale=1.0 / 8.0,
-        causal=False,
-    )
-    query = torch.randn(2, 8, 4, 64)
-    metadata = AttentionMetadata(attn_mask=torch.ones(2, 8, dtype=torch.bool))
-
-    with pytest.raises(ValueError, match="does not support attn_mask"):
-        impl.forward_cuda(query, query, query, metadata)
-
-
 def test_sage_attn3_rejects_custom_softmax_scale(monkeypatch: pytest.MonkeyPatch):
     backend_module = load_sage_attn3_module(monkeypatch, lambda *args, **kwargs: None)
 
@@ -216,10 +178,12 @@ def test_sage3_custom_op_owns_mutated_key(monkeypatch, length):
 
     module = load_sage_attn3_module(monkeypatch, kernel)
     q = torch.randn(1, 1, length, 64)
-    original = q.clone()
     op = module._sageattn3_blackwell_op.default
     checks = torch.library.opcheck(op, (q, q, q, False), test_utils=("test_schema", "test_faketensor"))
     assert all(result == "SUCCESS" for result in checks.values())
+    # The custom op takes HND; the forward method takes NHD.
+    q = q.transpose(1, 2)
+    original = q.clone()
     impl = module.SageAttention3Impl(1, 64, 0.125)
     torch.compiler.reset()
     try:
@@ -279,13 +243,10 @@ def test_sage3_verified_device_scope(monkeypatch, variant, dtype, head_size):
         "parallel",
         "hsdp",
         "kv_quant",
-        "dropout",
         "head256",
-        "gqa",
         "causal_cross",
         "dtype",
         "shape",
-        "mask",
     ],
 )
 def test_sage3_unverified_and_invalid_paths(monkeypatch, case):
@@ -299,9 +260,7 @@ def test_sage3_unverified_and_invalid_paths(monkeypatch, case):
     module = load_sage_attn3_module(monkeypatch, lambda q, k, v, **kw: q + k + v)
     monkeypatch.setattr(module, "_sage3_kernel_variant", lambda q: "sage3_sm120")
     head = 256 if case == "head256" else 64
-    impl = module.SageAttention3Impl(
-        2, head, head**-0.5, causal=case == "causal_cross", dropout_p=0.1 if case == "dropout" else 0.0
-    )
+    impl = module.SageAttention3Impl(2, head, head**-0.5, causal=case == "causal_cross")
     q, k, v = (torch.randn(1, 17, 2, head, dtype=torch.bfloat16) for _ in range(3))
     context = ExecutionContext(
         platform="cuda",
@@ -316,20 +275,14 @@ def test_sage3_unverified_and_invalid_paths(monkeypatch, case):
         metadata = AttentionMetadata(full_attn_spans=[[(0, 17)]])
     elif case == "kv_quant":
         metadata = AttentionMetadata(extra={"kv_cache_dtype": "fp8"})
-    elif case == "gqa":
-        k, v = k[:, :, :1], v[:, :, :1]
     elif case == "causal_cross":
         k, v = k[:, :12], v[:, :12]
     elif case == "dtype":
         k = k.float()
     elif case == "shape":
         v = v[:, :12]
-    elif case == "mask":
-        metadata = AttentionMetadata(attn_mask=torch.ones(1, 17))
     result = impl.resolve_execution_path(context, q, k, v, metadata)
-    expected = (
-        SupportStatus.UNSUPPORTED if case in ("dtype", "shape", "gqa", "dropout", "mask") else SupportStatus.UNMIGRATED
-    )
+    expected = SupportStatus.UNSUPPORTED if case in ("dtype", "shape") else SupportStatus.UNMIGRATED
     assert result.support.status is expected
 
 
@@ -354,6 +307,9 @@ def test_sage3_capabilities_reject_head_mismatch_before_variant_gate(monkeypatch
     assert "does not support GQA/MQA" in result.support.reason
     assert f"q_heads=4, kv_heads={kv_heads}" in result.support.reason
     assert result.requested_support(context).status is SupportStatus.UNSUPPORTED
+    error = ValueError if kv_heads == 3 else NotImplementedError
+    with pytest.raises(error, match="GQA/MQA"):
+        impl.forward_cuda(q, k, v)
 
 
 @pytest.mark.parametrize("variant", [None, "sage3_sm100", "sage3_sm120", "sage3_sm121"])

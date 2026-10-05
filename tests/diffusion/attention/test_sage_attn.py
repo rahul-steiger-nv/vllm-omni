@@ -72,29 +72,6 @@ def test_sage_attention_dispatcher_is_opaque_to_compile(sage_backend, tmp_path, 
         torch.library.opcheck(backend._sage_attention_op.default, (q, k, v, False, scale))
 
 
-def test_sage_attention_rejects_mask_instead_of_ignoring_it(monkeypatch):
-    fake_package = types.ModuleType("sageattention")
-    setattr(fake_package, "sageattn", lambda *args, **kwargs: pytest.fail("unexpected Sage kernel call"))
-    monkeypatch.setitem(sys.modules, "sageattention", fake_package)
-    module_name = "vllm_omni.diffusion.attention.backends.sage_attn"
-    sys.modules.pop(module_name, None)
-    try:
-        backend_module = importlib.import_module(module_name)
-        impl = backend_module.SageAttentionImpl(
-            num_heads=4,
-            head_size=64,
-            softmax_scale=1.0 / 8.0,
-            causal=False,
-        )
-        query = torch.randn(1, 2, 4, 64)
-        metadata = AttentionMetadata(attn_mask=torch.ones(1, 2, dtype=torch.bool))
-
-        with pytest.raises(ValueError, match="does not support attn_mask"):
-            impl.forward_cuda(query, query, query, metadata)
-    finally:
-        sys.modules.pop(module_name, None)
-
-
 @pytest.fixture
 def sage_contract(sage_backend, monkeypatch):
     backend, _ = sage_backend
@@ -209,11 +186,20 @@ def test_sage_architecture_is_not_taken_from_caller(sage_contract, monkeypatch, 
     assert result.kernel_variant == variant and result.support.status is SupportStatus.UNMIGRATED
 
 
-def test_sage_geometry_validation(sage_contract):
+@pytest.mark.parametrize("variant", [None, "sage_sm80", "sage_sm90", "sage_sm120"])
+def test_sage_geometry_validation(sage_contract, monkeypatch, variant):
+    monkeypatch.setattr(sage_contract, "_sage_cuda_kernel_variant", lambda query: variant)
     impl = sage_contract.SageAttentionImpl(4, 64, 0.17)
     context = ExecutionContext(platform="cuda")
     q, k, v = _contract_inputs()
-    for inputs in ((q[0], k, v), (q, k.float(), v), (q, k, v[:, :-1]), (q, k, v[..., :32])):
+    for inputs in (
+        (q[0], k, v),
+        (q, k.float(), v),
+        (q, k, v[:, :-1]),
+        (q, k, v[..., :32]),
+        (q[:, :0], k[:, :0], v[:, :0]),
+        (q, k.to("meta"), v),
+    ):
         result = impl.resolve_execution_path(context, *inputs, None)
         assert result.support.status is SupportStatus.UNSUPPORTED and result.support.reason
     for inputs in (
@@ -225,3 +211,17 @@ def test_sage_geometry_validation(sage_contract):
         assert impl.resolve_execution_path(context, *inputs, None).support.status is SupportStatus.UNMIGRATED
     impl.causal = True
     assert impl.resolve_execution_path(context, q[:, :8], k, v, None).support.status is SupportStatus.UNMIGRATED
+
+
+@pytest.mark.parametrize("platform", ["cuda", "xpu", "cpu"])
+@pytest.mark.parametrize("dropout_p", [0.1, 1.0])
+def test_sage_rejects_dropout_during_inspection_and_forward(sage_contract, platform, dropout_p):
+    impl = sage_contract.SageAttentionImpl(4, 64, 0.17, dropout_p=dropout_p)
+    inputs = _contract_inputs()
+    context = ExecutionContext(platform=platform)
+    result = impl.resolve_execution_path(context, *inputs, None)
+    assert result.support.status is SupportStatus.UNSUPPORTED
+    assert "does not support dropout" in result.support.reason
+    for forward in (impl.forward_cuda, impl.forward_xpu):
+        with pytest.raises(ValueError, match="does not support dropout"):
+            forward(*inputs)

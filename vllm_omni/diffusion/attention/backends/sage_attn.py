@@ -143,6 +143,7 @@ class SageAttentionImpl(AttentionImpl):
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
+        self.dropout = extra_impl_args.get("dropout_p", 0.0)
         if backend_kwargs:
             logger.warning("SageAttentionImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
 
@@ -157,6 +158,13 @@ class SageAttentionImpl(AttentionImpl):
         result = ExecutionPathResult.unmigrated("SAGE_ATTN", replace(context, kernel_variant=None), path="unverified")
         if attn_metadata is not None and attn_metadata.attn_mask is not None:
             return replace(result, support=CapabilityResult.unsupported("SAGE_ATTN: attn_mask is not supported"))
+        if self.dropout != 0.0:
+            return replace(
+                result,
+                support=CapabilityResult.unsupported(
+                    f"SAGE_ATTN: does not support dropout (dropout_p={self.dropout})."
+                ),
+            )
         # XPU's ARK route is separate and has not been migrated.
         if context.platform != "cuda":
             return result
@@ -184,23 +192,6 @@ class SageAttentionImpl(AttentionImpl):
                     "SAGE_ATTN requires sageattention; install it or select another backend."
                 ),
             )
-        if (
-            context.kernel_variant != "sage_sm90"
-            or context.dtype not in ("float16", "bfloat16")
-            or context.packing_mode is not PackingMode.NONE
-            or context.piecewise
-            or context.paged_kv
-            or context.kv_cache_dtype not in (None, "auto", "float")
-            or context.parallel_strategy is not ParallelStrategy.NONE
-            or context.outer_boundaries
-        ):
-            return replace(
-                result,
-                support=CapabilityResult.unmigrated(
-                    "Only dense FP16/BF16 SageAttention on SM90 without packed, parallel, "
-                    "or outer boundaries is migrated."
-                ),
-            )
         if any(t.ndim != 4 for t in (query, key, value)):
             reason = "Q, K, and V must have rank 4 (batch, sequence, heads, head dimension)."
         elif query.dtype != key.dtype or query.dtype != value.dtype:
@@ -218,6 +209,23 @@ class SageAttentionImpl(AttentionImpl):
                 result,
                 support=CapabilityResult.unsupported(
                     "SAGE_ATTN: " + reason + " Select compatible inputs or another backend."
+                ),
+            )
+        if (
+            context.kernel_variant != "sage_sm90"
+            or context.dtype not in ("float16", "bfloat16")
+            or context.packing_mode is not PackingMode.NONE
+            or context.piecewise
+            or context.paged_kv
+            or context.kv_cache_dtype not in (None, "auto", "float")
+            or context.parallel_strategy is not ParallelStrategy.NONE
+            or context.outer_boundaries
+        ):
+            return replace(
+                result,
+                support=CapabilityResult.unmigrated(
+                    "Only dense FP16/BF16 SageAttention on SM90 without packed, parallel, "
+                    "or outer boundaries is migrated."
                 ),
             )
         # These are the validated paths, not an exhaustive kernel support table.
@@ -244,6 +252,8 @@ class SageAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         _validate_sage_metadata(attn_metadata)
+        if self.dropout != 0.0:
+            raise ValueError(f"SAGE_ATTN: does not support dropout (dropout_p={self.dropout}).")
         if sageattn is None:
             raise ImportError(
                 "SAGE_ATTN requires sageattention. Install with: "
@@ -266,6 +276,8 @@ class SageAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         _validate_sage_metadata(attn_metadata)
+        if self.dropout != 0.0:
+            raise ValueError(f"SAGE_ATTN: does not support dropout (dropout_p={self.dropout}).")
         if xpu_sageattn is None:
             raise ImportError("XPU SageAttention requires auto-round-lib. Install with: pip install auto-round-lib")
         orig_dtype = query.dtype
