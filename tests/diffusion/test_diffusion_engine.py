@@ -950,6 +950,7 @@ async def test_async_add_req_and_stream_response():
     engine.scheduler = MockScheduler()
     engine._out_streams = {}
     engine._unclaimed_async_outputs = {}
+    engine._shutdown_output_futures = {}
     engine.abort_queue: queue.Queue[str] = queue.Queue()
     engine._rpc_queue = queue.Queue()
     engine._rpc_lock = threading.RLock()

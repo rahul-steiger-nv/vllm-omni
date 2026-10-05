@@ -179,6 +179,7 @@ def _make_engine_with_loop(
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._out_streams = {}
     engine._unclaimed_async_outputs = {}
+    engine._shutdown_output_futures = {}
     engine._closed = False
     engine.abort_queue = queue.Queue()
     engine._rpc_queue = queue.Queue()

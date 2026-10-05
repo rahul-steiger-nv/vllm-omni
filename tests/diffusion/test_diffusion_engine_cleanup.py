@@ -46,6 +46,7 @@ def _make_engine() -> DiffusionEngine:
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._out_streams = {}
     engine._unclaimed_async_outputs = {}
+    engine._shutdown_output_futures = {}
     engine._closed = False
     engine._shutting_down = False
     engine._shutdown_complete = False
@@ -64,6 +65,73 @@ def _make_output_executor() -> MultiprocDiffusionExecutor:
     executor._dropped_output_ids = OrderedDict()
     executor._closed = False
     return executor
+
+
+def _make_shutdown_output_executor() -> MultiprocDiffusionExecutor:
+    executor = _make_output_executor()
+    # Stub process infrastructure, but exercise the real shutdown/cache cleanup.
+    executor._pump_stop = threading.Event()
+    executor._shutdown_cleaner = None
+    executor._finalizer = SimpleNamespace(alive=False)
+    executor._result_pump_threads = []
+    executor._rpc_futures = {}
+    executor._batch_split_map = {}
+    return executor
+
+
+def test_wait_output_ready_after_shutdown_fails_immediately() -> None:
+    executor = _make_shutdown_output_executor()
+    executor.shutdown()
+
+    ready = executor.wait_output_ready("aid-after-shutdown")
+
+    try:
+        assert ready.done(), "A stopped executor must not create a waiter that cannot complete"
+        with pytest.raises(RuntimeError, match="(?i)shut down|shutdown|closed"):
+            ready.result()
+        assert not executor._output_futures
+    finally:
+        ready.cancel()
+        executor.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ready_before_close", [False, True])
+async def test_close_with_real_executor_resolves_queued_output(monkeypatch, ready_before_close: bool) -> None:
+    engine = _make_engine()
+    engine.main_loop = None
+    executor = _make_shutdown_output_executor()
+    engine.executor = executor
+    monkeypatch.setattr(diffusion_engine_module, "_async_output_timeout", lambda: 0.05)
+    engine._out_streams["live"] = asyncio.Queue()
+    stream = engine.get_output_stream("live")
+    next_output = asyncio.create_task(anext(stream))
+    await asyncio.sleep(0)
+
+    materialized_output = DiffusionOutput(output="cached", finished=True)
+    ready: concurrent.futures.Future[DiffusionOutput] = concurrent.futures.Future()
+    ready.set_result(materialized_output)
+    if ready_before_close:
+        executor._completed_outputs["aid-live"] = ready
+    # Wake the consumer, then close before it gets another event-loop turn.
+    engine._put_output("live", DiffusionOutput(async_output_id="aid-live", finished=True))
+    engine.close()
+
+    try:
+        if ready_before_close:
+            assert await next_output is materialized_output
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream)
+        else:
+            with pytest.raises(RuntimeError, match="Executor shut down"):
+                await next_output
+        assert not engine._unclaimed_async_outputs
+        assert not engine._shutdown_output_futures
+        assert not executor._completed_outputs
+        assert not executor._output_futures
+    finally:
+        await stream.aclose()
+        executor.shutdown()
 
 
 def test_close_completes_pending_output_streams() -> None:
