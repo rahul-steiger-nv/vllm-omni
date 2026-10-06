@@ -21,6 +21,8 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 from vllm_omni.diffusion.attention.capabilities import (
+    CapabilityResult,
+    CompilationMode,
     ExecutionContext,
     ExecutionPathResult,
     OuterBoundary,
@@ -202,16 +204,26 @@ class Attention(nn.Module):
 
             self.attn_backend = attn_backend_cls
             if isinstance(spec, BlockSparseAttentionSpec):
-                from vllm_omni.diffusion.attention.block_sparse import BlockSparseAttention, BlockSparseBackend
+                from vllm_omni.diffusion.attention.block_sparse import (
+                    BlockSparseAttention,
+                    BlockSparseBackend,
+                    validate_block_sparse_parallel,
+                )
 
                 if impl_overrides and attn_backend_cls.get_name() in impl_overrides:
                     raise ValueError("Block-sparse attention does not support dense implementation overrides")
                 adapter_cls = attn_backend_cls.get_block_sparse_adapter()
                 if adapter_cls is None:
                     raise ValueError("Selected provider has no adapter for the shared block selection")
+                degree = validate_block_sparse_parallel(config)
+                self._sparse_ulysses_degree = 1 if skip_sequence_parallel else degree
+                if scatter_idx != 2 or gather_idx != 1:
+                    raise ValueError("Block-sparse attention requires BSHD sequence/head axes")
+                if num_heads % self._sparse_ulysses_degree or self.num_kv_heads % self._sparse_ulysses_degree:
+                    raise ValueError("Block-sparse Ulysses requires Q and KV heads divisible by ulysses_degree")
                 self.attention = BlockSparseAttention(
-                    num_heads,
-                    num_heads if num_kv_heads is None else num_kv_heads,
+                    num_heads // self._sparse_ulysses_degree,
+                    self.num_kv_heads // self._sparse_ulysses_degree,
                     head_size,
                     softmax_scale,
                     causal,
@@ -439,6 +451,8 @@ class Attention(nn.Module):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
+        *,
+        inputs_are_local: bool = False,
     ) -> ExecutionPathResult:
         """Compose backend capabilities with outer Attention boundaries."""
         boundaries = set(context.outer_boundaries)
@@ -469,6 +483,27 @@ class Attention(nn.Module):
             )
         if not resolved_context.paged_kv:
             attn_metadata = self._with_kv_cache_dtype(attn_metadata)
+        if parallel_strategy is ParallelStrategy.ULYSSES and isinstance(self.attn_spec, BlockSparseAttentionSpec):
+            if get_ulysses_mode(default="strict") != "strict" or not inputs_are_local:
+                return ExecutionPathResult(
+                    backend="BLOCK_SPARSE",
+                    path="ulysses_local",
+                    platform=resolved_context.platform,
+                    kernel_variant=resolved_context.kernel_variant,
+                    support=CapabilityResult.unsupported(
+                        "Sparse capability queries require strict Ulysses and actual post-communication local inputs"
+                    ),
+                    compilation_mode=CompilationMode.EAGER_ONLY,
+                    parallel_strategy=parallel_strategy,
+                )
+            local = resolver(
+                replace(resolved_context, parallel_strategy=ParallelStrategy.NONE),
+                query,
+                key,
+                value,
+                attn_metadata,
+            )
+            return replace(local, parallel_strategy=parallel_strategy, compilation_mode=CompilationMode.EAGER_ONLY)
         return resolver(
             resolved_context,
             query,
@@ -509,9 +544,22 @@ class Attention(nn.Module):
                 "Only the startup KV memory profile may execute before paged KV initialization."
             )
         use_paged_attention = paged_adapter is not None and self.paged_kv_cache_role is not None
+        sparse_ulysses = False
         if isinstance(self.attn_spec, BlockSparseAttentionSpec):
-            if use_paged_attention or (strategy is not self._no_parallel_strategy and strategy.enabled):
-                raise ValueError("Block-sparse attention does not support paged KV or sequence parallel execution")
+            sparse_ulysses = (
+                strategy.name == "ulysses"
+                and strategy.enabled
+                and not self.use_ring
+                and self._sparse_ulysses_degree > 1
+            )
+            if sparse_ulysses and get_ulysses_mode(default="strict") != "strict":
+                raise ValueError("Block-sparse attention requires strict Ulysses mode")
+            if use_paged_attention or (
+                strategy is not self._no_parallel_strategy and strategy.enabled and not sparse_ulysses
+            ):
+                raise ValueError("Block-sparse attention does not support paged KV or this sequence parallel mode")
+            if self._sparse_ulysses_degree > 1 and not sparse_ulysses:
+                raise ValueError("Block-sparse Ulysses requires an active sharded region and initialized Ulysses group")
         if use_paged_attention and not getattr(self.attn_backend, "supports_paged_kv", False):
             backend_name = (
                 self.attn_backend.get_name() if self.attn_backend is not None else type(self.attention).__name__
@@ -534,6 +582,20 @@ class Attention(nn.Module):
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
         # For Ring: Concat joint_q
         query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
+
+        sparse_sp_padding = 0
+        if sparse_ulysses and attn_metadata is not None:
+            sparse_sp_padding = attn_metadata.extra.get("ulysses_sp_padding", 0)
+            if sparse_sp_padding:
+                if (
+                    type(sparse_sp_padding) is not int
+                    or not 0 < sparse_sp_padding < query.shape[1]
+                    or attn_metadata.joint_strategy != "front"
+                ):
+                    raise ValueError("Invalid sparse Ulysses suffix padding")
+                query = query[:, :-sparse_sp_padding].contiguous()
+                key = key[:, :-sparse_sp_padding].contiguous()
+                value = value[:, :-sparse_sp_padding].contiguous()
 
         # Scheduler rows describe the logical sequence, while strict Ulysses
         # may append synthetic tokens solely to make the image shard divisible.
@@ -589,6 +651,10 @@ class Attention(nn.Module):
             padding_start = paged_sp_padding_offset - paged_sp_padding
             output_padding = out.new_zeros((out.shape[0], paged_sp_padding, *out.shape[2:]))
             out = torch.cat((out[:, :padding_start], output_padding, out[:, padding_start:]), dim=1)
+
+        if sparse_sp_padding:
+            padding = out.new_zeros((out.shape[0], sparse_sp_padding, *out.shape[2:]))
+            out = torch.cat((out, padding), dim=1)
 
         # 3. Post-processing (Reverse Communication)
         # For Ulysses: AllToAll Output, and AllGather Joint Output

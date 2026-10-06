@@ -87,7 +87,44 @@ Typed `PackedPaddingMetadata` supports a single document with suffix padding
 at batch size one. Real Q/K/V lengths are trimmed before routing, and padded
 output rows are restored as zeros. MiniMax supplies this metadata automatically.
 
+## Strict Ulysses
+
+The Cosmos3 recipe also supports pure strict Ulysses with ordinary static
+`per_role` configuration. Set `ulysses_degree=2` and `ulysses_mode="strict"`.
+No attention strategy or denoising schedule is required. Q and KV head counts
+must both be divisible by the Ulysses degree. Replicated multi-control attention
+keeps its full local heads and does not enter the Ulysses wrapper.
+
+The shared attention layer uses the existing all-to-all and prepares sparse
+kernels with the resulting local head counts. Cosmos3 marks synthetic sequence
+padding; it is removed after all-to-all, before block selection, and zero rows
+are restored before the reverse communication. Real understanding tokens remain
+a protected KV prefix. Other models must supply equivalent padding metadata or
+use sequences that need no padding; this does not enable arbitrary sparse masks.
+
+Capability queries for the composed wrapper require `inputs_are_local=True`
+and the actual post-communication tensors. They execute no collectives or
+kernels. Local request preparation is still required. The wrapper reports
+`EAGER_ONLY`; this does not promise fullgraph capture of communication. Regional
+compilation may compile the local work and leave graph breaks around collectives.
+
+Run the two-rank Cosmos3 validation on two Hopper GPUs with FA4 `4.0.0b33`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python -m pytest -v \
+  tests/diffusion/models/cosmos3/test_cosmos3_sparse_ulysses.py
+```
+
+The tests spawn both ranks themselves. They compare single-device and two-rank
+outputs, exercise padded and unpadded requests, verify sparse dispatch per layer,
+and cover eager/regional execution with no, model, and layerwise offloading.
+
 ## Current validation
+
+Strict Ulysses: all four cases in `test_cosmos3_sparse_ulysses.py` passed on
+two Hopper GPUs with FA4 `4.0.0b33`, including eager/regional execution and both
+CPU offload modes. Test lengths exceed the selector's minimum retained-block
+budget, so the parity check exercises actual sparse selection.
 
 Validation used the vLLM-Omni 0.30.0 image, published FA4 `4.0.0b33`,
 PyTorch `2.13.0+cu130` and CuTe DSL `4.7.1`.
@@ -143,7 +180,8 @@ because they have not been refreshed for the current implementation.
 ## Limitations and follow-up
 
 Arbitrary masks, causal sparse attention, multi-document packing,
-paged or quantized KV, and sequence-parallel wrappers are unsupported. Diffusers
+paged or quantized KV, Ring, AllGather-KV, advanced Ulysses, and hybrid
+parallel modes are unsupported. Diffusers
 rejects sparse configurations before loading weights; sparse execution needs a
 native model integration.
 

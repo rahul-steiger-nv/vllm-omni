@@ -928,3 +928,32 @@ def test_shared_compilation_boundary_is_custom_op(adapter_mode):
     )
     assert result.support.status is SupportStatus.SUPPORTED
     assert result.compilation_mode is CompilationMode.CUSTOM_OP
+
+
+@pytest.mark.cuda
+@torch.inference_mode()
+def test_sparse_ulysses_head_geometry_and_replicated_execution(hopper, monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.attention import layer as layer_mod
+    from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+
+    monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kw: NoParallelAttention())
+    config = SimpleNamespace(
+        diffusion_attention_config=AttentionConfig(default={"name": "block_sparse"}),
+        parallel_config=SimpleNamespace(ring_degree=1, ulysses_degree=2, sequence_parallel_size=2),
+        diffusion_kv_cache_dtype=None,
+    )
+    with set_current_diffusion_config(config):
+        with pytest.raises(ValueError, match="heads divisible"):
+            layer_mod.Attention(4, 128, False, 0.1, num_kv_heads=1)
+        sharded = layer_mod.Attention(4, 128, False, 0.1, num_kv_heads=2)
+        replicated = layer_mod.Attention(4, 128, False, 0.1, num_kv_heads=2, skip_sequence_parallel=True)
+    assert (sharded.attention.num_heads, sharded.attention.num_kv_heads) == (2, 1)
+    assert (replicated.attention.num_heads, replicated.attention.num_kv_heads) == (4, 2)
+    q = torch.randn(1, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 64, 2, 128, device="cuda", dtype=q.dtype)
+    with pytest.raises(ValueError, match="active sharded region"):
+        sharded(q, k, k)
+    assert replicated(q, k, k).shape == q.shape

@@ -53,6 +53,27 @@ def _block_sparse_request_fake(query, key, value, prefix, owner_handle):
     return query.new_empty((*query.shape[:-1], value.shape[-1]))
 
 
+def validate_block_sparse_parallel(config):
+    """Admit local execution or pure strict Ulysses; kernels consume local heads."""
+    parallel = getattr(config, "parallel_config", None)
+    degree = getattr(parallel, "ulysses_degree", 1) or 1
+    if (
+        (getattr(parallel, "sequence_parallel_size", degree) or degree) != degree
+        or any((getattr(parallel, name, 1) or 1) != 1 for name in ("ring_degree", "allgather_degree"))
+        or getattr(parallel, "use_hsdp", False)
+    ):
+        raise ValueError("Block-sparse attention supports only local execution or pure strict Ulysses")
+    if degree > 1:
+        if getattr(parallel, "ulysses_mode", "strict") != "strict":
+            raise ValueError("Block-sparse attention requires strict Ulysses mode")
+        if any(
+            (getattr(parallel, name, 1) or 1) != 1
+            for name in ("tensor_parallel_size", "pipeline_parallel_size", "data_parallel_size", "cfg_parallel_size")
+        ) or getattr(config, "enable_distributed_layerwise_offload", False):
+            raise ValueError("Block-sparse Ulysses does not support combined parallel modes")
+    return degree
+
+
 class BlockSparseBackend(AttentionBackend):
     """Method-level preflight capabilities, independent of the dense provider.
 
@@ -135,16 +156,7 @@ class BlockSparseAttention(AttentionImpl[AttentionMetadata]):
         self.head_size = head_size
         cfg = get_current_diffusion_config_or_none()
         if cfg is not None:
-            parallel = getattr(cfg, "parallel_config", None)
-            if any(
-                (getattr(parallel, name, 1) or 1) > 1
-                for name in (
-                    "sequence_parallel_size",
-                    "ring_degree",
-                    "allgather_degree",
-                )
-            ) or getattr(parallel, "use_hsdp", False):
-                raise ValueError("Block-sparse attention parallel wrappers require separate validation")
+            validate_block_sparse_parallel(cfg)
             if getattr(cfg, "fa_deterministic", False):
                 raise ValueError("Block-sparse attention does not support fa_deterministic")
             if getattr(cfg, "diffusion_kv_cache_dtype", None) not in (None, "auto", "float"):

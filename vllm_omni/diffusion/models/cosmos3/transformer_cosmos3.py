@@ -14,6 +14,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
@@ -34,7 +35,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as FrameworkAttention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import BlockSparseAttentionSpec, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.norm import RMSNorm as _VllmRMSNorm
@@ -798,9 +799,12 @@ class Cosmos3CrossAttention(nn.Module):
 
         gen_mask = None
         joint_mask = None
+        sparse_sp_padding = 0
         if is_forward_context_available():
             ctx = get_forward_context()
-            if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+            if isinstance(getattr(self.attn, "attn_spec", None), BlockSparseAttentionSpec):
+                sparse_sp_padding = ctx.sp_padding_size
+            elif ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
                 padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
                 gen_mask = torch.ones(B, padded_seq_len, dtype=torch.bool, device=q.device)
                 gen_mask[:, ctx.sp_original_seq_len :] = False
@@ -815,7 +819,7 @@ class Cosmos3CrossAttention(nn.Module):
             joint_key=k_und,
             joint_value=v_und,
             joint_strategy="front",
-            extra={"protected_kv_prefix": k_und.shape[1]},
+            extra={"protected_kv_prefix": k_und.shape[1], "ulysses_sp_padding": sparse_sp_padding},
         )
         out = self.attn(q, k, v, attn_metadata)
         return out.reshape(B, S_gen, -1)
@@ -1439,6 +1443,21 @@ class Cosmos3VFMTransformer(nn.Module):
             if release_completed_blocks_to_meta:
                 release_module_parameters_to_meta(layer)
             self.gen_layers.append(layer)
+
+        gen_attentions = [
+            module
+            for module in self.gen_layers.modules()
+            if isinstance(module, FrameworkAttention) and getattr(module, "role", None) == "cosmos3.gen"
+        ]
+        if gen_attentions and all(isinstance(attn.attn_spec, BlockSparseAttentionSpec) for attn in gen_attentions):
+            # Sparse attention removes the synthetic suffix after all-to-all.
+            self._sp_plan = {
+                **self._sp_plan,
+                "gen_sp_prepare": {
+                    index: replace(spec, mask_free_padding=True)
+                    for index, spec in self._sp_plan["gen_sp_prepare"].items()
+                },
+            }
 
         self.mixed_precision_runtime: Cosmos3MixedPrecisionRuntime | None = None
         if mixed_precision_config is not None:

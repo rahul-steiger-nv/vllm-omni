@@ -225,6 +225,9 @@ class SequenceParallelInput:
             ForwardContext so models can construct attention masks when needed.
             Note: Ring attention does not support attention mask, so auto_pad
             should only be used with Ulysses SP.
+        mask_free_padding: The consumer removes synthetic padding before attention
+            and restores it before reverse communication. Skip the backend mask
+            requirement only under this explicit model contract.
         shard_group: Optional key shared by tensors representing the same global
             sequence. Keyed groups track independent padding metadata; omitting
             it preserves the legacy single-sequence padding behavior.
@@ -245,6 +248,7 @@ class SequenceParallelInput:
     split_output: bool = False
     auto_pad: bool = False
     shard_group: str | None = None
+    mask_free_padding: bool = False
 
     def __repr__(self) -> str:
         return (
