@@ -174,7 +174,7 @@ def test_sparse_head_shards_and_padding_on_one_gpu(monkeypatch):
 
 
 @torch.inference_mode()
-def _worker(rank, offload_mode, init_method):
+def _worker(rank, offload_mode, init_method, degree=2):
     from tests.model_executor.helpers import bootstrap_vllm_layer_custom_op_modules
 
     bootstrap_vllm_layer_custom_op_modules()
@@ -199,9 +199,9 @@ def _worker(rank, offload_mode, init_method):
     with pytest.MonkeyPatch.context() as patch:
         current_omni_platform.set_device(device)
         parallel_state.init_distributed_environment(
-            world_size=2, rank=rank, local_rank=rank, distributed_init_method=init_method, backend="nccl"
+            world_size=degree, rank=rank, local_rank=rank, distributed_init_method=init_method, backend="nccl"
         )
-        parallel_state.initialize_model_parallel(sequence_parallel_size=2, ulysses_degree=2)
+        parallel_state.initialize_model_parallel(sequence_parallel_size=degree, ulysses_degree=degree)
         try:
             from vllm.model_executor import parameter
             from vllm.model_executor.layers import linear
@@ -243,7 +243,7 @@ def _worker(rank, offload_mode, init_method):
                 )
 
             with set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cuda"))):
-                reference_config, sp_config = configuration(1), configuration(2)
+                reference_config, sp_config = configuration(1), configuration(degree)
                 with set_current_diffusion_config(reference_config), context(reference_config, 0):
                     reference = cosmos.Cosmos3VFMTransformer(reference_config).to(device=device, dtype=common["dtype"])
                 reference.post_load_weights()
@@ -255,8 +255,9 @@ def _worker(rank, offload_mode, init_method):
                 model.load_state_dict(reference.state_dict())
                 model.post_load_weights()
                 model.eval()
-                apply_sequence_parallel(model, SequenceParallelConfig(ulysses_degree=2), model._sp_plan)
-                assert model.gen_layers[0].cross_attention.attn.parallel_strategy.name == "ulysses"
+                if degree > 1:
+                    apply_sequence_parallel(model, SequenceParallelConfig(ulysses_degree=degree), model._sp_plan)
+                    assert model.gen_layers[0].cross_attention.attn.parallel_strategy.name == "ulysses"
                 # More than eight candidate blocks: exercise actual sparse selection.
                 shapes = (32, 33)
                 inputs = [
@@ -332,7 +333,9 @@ def _worker(rank, offload_mode, init_method):
                         AttentionMetadata(extra={"protected_kv_prefix": prefix}),
                         inputs_are_local=True,
                     )
-                    assert result.parallel_strategy is ParallelStrategy.ULYSSES
+                    assert result.parallel_strategy is (
+                        ParallelStrategy.ULYSSES if degree > 1 else ParallelStrategy.NONE
+                    )
                     assert result.support.status is SupportStatus.SUPPORTED
                     sparse_calls.append(index)
                     return output
@@ -402,3 +405,8 @@ def test_static_sparse_ulysses_two_rank_parity(tmp_path, offload_mode):
         args=(offload_mode, f"file://{tmp_path / 'rendezvous'}"),
         nprocs=2,
     )
+
+
+@pytest.mark.parametrize("offload_mode", ["model", "layerwise"])
+def test_static_sparse_offloading(tmp_path, offload_mode):
+    _worker(0, offload_mode, f"file://{tmp_path / 'rendezvous'}", degree=1)

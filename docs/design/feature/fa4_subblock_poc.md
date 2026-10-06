@@ -87,19 +87,24 @@ Typed `PackedPaddingMetadata` supports a single document with suffix padding
 at batch size one. Real Q/K/V lengths are trimmed before routing, and padded
 output rows are restored as zeros. MiniMax supplies this metadata automatically.
 
-## Strict Ulysses
+## Strict Ulysses and CPU offloading
 
-The Cosmos3 recipe also supports pure strict Ulysses with ordinary static
+The Cosmos3 and MiniMax H3 recipes support pure strict Ulysses with ordinary static
 `per_role` configuration. Set `ulysses_degree=2` and `ulysses_mode="strict"`.
 No attention strategy or denoising schedule is required. Q and KV head counts
 must both be divisible by the Ulysses degree. Replicated multi-control attention
-keeps its full local heads and does not enter the Ulysses wrapper.
+keeps its full local heads and does not enter the Ulysses wrapper. MiniMax H3's
+token refiner likewise stays replicated and dense.
 
 The shared attention layer uses the existing all-to-all and prepares sparse
 kernels with the resulting local head counts. Cosmos3 marks synthetic sequence
 padding; it is removed after all-to-all, before block selection, and zero rows
 are restored before the reverse communication. Real understanding tokens remain
-a protected KV prefix. Other models must supply equivalent padding metadata or
+a protected KV prefix. MiniMax H3 instead uses its existing single-document
+`PackedPaddingMetadata`: padding is trimmed after all-to-all by the sparse
+executor and zero output rows are restored before the reverse communication.
+Its packed total must divide evenly across ranks, and multi-request packed
+batches remain unsupported. Other models must supply equivalent padding metadata or
 use sequences that need no padding; this does not enable arbitrary sparse masks.
 
 Capability queries for the composed wrapper require `inputs_are_local=True`
@@ -108,11 +113,17 @@ kernels. Local request preparation is still required. The wrapper reports
 `EAGER_ONLY`; this does not promise fullgraph capture of communication. Regional
 compilation may compile the local work and leave graph breaks around collectives.
 
-Run the two-rank Cosmos3 validation on two Hopper GPUs with FA4 `4.0.0b33`:
+Both models reuse their existing model and layerwise CPU offloading. These modes
+work with sparse attention on one GPU or with pure strict Ulysses, in eager or
+regional compilation. Distributed layerwise offloading and combined parallel
+modes are outside this validation.
+
+Run the validation on two Hopper GPUs with FA4 `4.0.0b33`:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 python -m pytest -v \
-  tests/diffusion/models/cosmos3/test_cosmos3_sparse_ulysses.py
+  tests/diffusion/models/cosmos3/test_cosmos3_sparse_ulysses.py \
+  tests/diffusion/models/minimax_h3/test_minimax_h3_sparse_ulysses.py
 ```
 
 The tests spawn both ranks themselves. They compare single-device and two-rank
@@ -121,10 +132,12 @@ and cover eager/regional execution with no, model, and layerwise offloading.
 
 ## Current validation
 
-Strict Ulysses: all four cases in `test_cosmos3_sparse_ulysses.py` passed on
-two Hopper GPUs with FA4 `4.0.0b33`, including eager/regional execution and both
-CPU offload modes. Test lengths exceed the selector's minimum retained-block
-budget, so the parity check exercises actual sparse selection.
+Ulysses and offloading: all six Cosmos3 cases and five MiniMax H3 cases passed
+on Hopper GPUs with FA4 `4.0.0b33`. Coverage includes standalone model and
+layerwise CPU offloading, two-rank Ulysses with each offload mode, and eager and
+regional compilation. These tests use small randomly initialized models, not
+full checkpoints. Test lengths exceed the selector's minimum retained-block
+budget, so the parity checks exercise actual sparse selection.
 
 Validation used the vLLM-Omni 0.30.0 image, published FA4 `4.0.0b33`,
 PyTorch `2.13.0+cu130` and CuTe DSL `4.7.1`.
