@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -103,7 +104,7 @@ def test_auxiliary_outputs_retain_legacy_float_ipc(monkeypatch, kind, enabled, d
     cfg = config(enabled)
     params = OmniDiffusionSamplingParams()
     payload = {"video": decoded(device=device)}
-    metadata = {"video": {"fps": 12}}
+    metadata: dict[str, Any] = {"video": {"fps": 12}}
     extra = torch.arange(24, dtype=torch.float32, device=device).reshape(1, 2, 12)
     if kind == "audio":
         payload.update(audio=extra, audio_sample_rate=48000)
