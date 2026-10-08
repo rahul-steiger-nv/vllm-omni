@@ -14,7 +14,10 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.cosmos3 import guardrails
+# RetinaFace (via cosmos_guardrail) disables autograd at import time. Restore
+# the caller's grad mode so collection does not affect unrelated tests.
+with torch.set_grad_enabled(torch.is_grad_enabled()):
+    from vllm_omni.diffusion.models.cosmos3 import guardrails
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 

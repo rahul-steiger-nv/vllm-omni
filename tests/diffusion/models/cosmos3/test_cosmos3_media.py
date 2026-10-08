@@ -11,10 +11,15 @@ from diffusers.video_processor import VideoProcessor
 from vllm_omni.diffusion import ipc
 from vllm_omni.diffusion.data import VideoOutputTransportConfig
 from vllm_omni.diffusion.media import FloatVideoConsumer, VideoTensorEncoding
-from vllm_omni.diffusion.models.cosmos3 import guardrails, pipeline_cosmos3
+from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
 from vllm_omni.diffusion.postprocess import device_reduction
 from vllm_omni.diffusion.postprocess import media as media_postprocess
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+# RetinaFace (via cosmos_guardrail) disables autograd at import time. Restore
+# the caller's grad mode so collection does not affect unrelated tests.
+with torch.set_grad_enabled(torch.is_grad_enabled()):
+    from vllm_omni.diffusion.models.cosmos3 import guardrails
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
