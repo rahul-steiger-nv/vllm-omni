@@ -40,6 +40,47 @@ kernel-ID selector. Provider preference lists are not supported.
 The selected role uses sparse attention on every invocation. There is no layer
 or denoising-step schedule. Exact roles take precedence over legacy `self`
 overrides; Cosmos3 multi-control requires its own explicit sparse override.
+These are experimental execution examples; 75% is not a quality-qualified default.
+
+### Composition with scheduling and sparse plugins
+
+The current configuration selects either an `AttentionSpec` (a complete backend)
+or a `BlockSparseAttentionSpec` (shared selection plus a provider-owned execution
+adapter) for each role. `AttentionSpec.block_sparse` is an existing typed option
+for complete backends such as RainFusion; it is not an alias for
+`BlockSparseAttentionSpec`. Mixed `backend` and `name/config` fields are rejected.
+
+[RFC #8382](https://github.com/vllm-project/vllm-omni/issues/8382) proposes
+`AttentionSpec.sparse` with `backend`, `start_step`, and `options`. That field is
+not implemented here. The proposed composition, to agree before stabilizing the
+public API, is:
+
+- Normalize the step policy into a dense method, a sparse method, and one shared
+  schedule. The sparse method may be a complete backend or this selected-block
+  method. Reuse `BlockSparseAttentionSpec` for the latter's geometry, selector,
+  and provider options; do not introduce a second set of equivalent knobs.
+- Resolve role precedence once, then resolve both methods through platform-owned
+  dispatch. A provider plugin supplying a selected-block adapter uses the existing
+  backend registry and `get_block_sparse_adapter()` contract. A complete sparse
+  method retains its own backend contract and is not assumed to accept
+  `BlockSelection`. No second provider registry is needed.
+- Keep scheduling outside the selector and kernel adapter. Exactly one policy
+  owns logical denoising progress; reject combinations with an independent backend
+  schedule unless that backend exposes an explicitly externally scheduled mode.
+  Sparse steps must not silently fall back to dense execution.
+- Preserve model-facing metadata capability queries for every reachable method.
+  Require metadata valid for both phases (or model-owned phase-specific metadata)
+  rather than advertising only the dense backend's capabilities. Query execution
+  support for the chosen method using actual local tensors after communication;
+  selection-time capability queries launch no kernels or collectives, and sparse
+  preparation remains an explicit execution requirement.
+
+The [Cosmos3 strategy PoC (#8583)](https://github.com/vllm-project/vllm-omni/pull/8583)
+demonstrates separate presets, layouts, and schedules on this foundation. It is
+an example of composition, not an implementation of the proposed
+`AttentionSpec.sparse` spelling or a finalized common schema. Parsing,
+serialization, plugin dispatch, metadata queries, and missing/boundary step
+handling need shared acceptance tests when that schema is implemented.
 
 ### What 75% sparsity means
 
@@ -118,6 +159,23 @@ work with sparse attention on one GPU or with pure strict Ulysses, in eager or
 regional compilation. Distributed layerwise offloading and combined parallel
 modes are outside this validation.
 
+| Execution combination | Scope and evidence |
+| --- | --- |
+| Single GPU, no offload | Local FA4 correctness and compilation tests, including dynamic/fullgraph execution |
+| Single GPU, model or layerwise CPU offload | Small-model Cosmos3 and MiniMax H3 tests, eager and regional compilation |
+| Pure strict Ulysses, no offload | Two-rank Hopper/FA4 small-model parity, padding, and sparse-dispatch tests for both models |
+| Pure strict Ulysses, model or layerwise CPU offload | The same two-rank tests with each offload mode, eager and regional compilation |
+| Fullgraph capture of the Ulysses wrapper, or full-model compilation with offload | Not established by this PoC; use eager or regional compilation |
+| Distributed layerwise offload, Ring, AllGather-KV, advanced Ulysses, HSDP, or hybrid parallelism | Outside supported scope |
+| Cosmos3 tensor parallelism | Rank-local projections and attention tested; full TP collectives and generation remain unvalidated |
+
+The two-rank evidence uses Hopper 64×64 geometry. Local Blackwell 256×128
+adapter tests do not qualify Blackwell Ulysses/offload combinations. Ordinary
+layerwise CPU offload on each Ulysses rank is distinct from the distributed
+layerwise offloader and its separate weight-transfer policies. With the current ordinary
+layerwise offloader, MiniMax streams its DiT blocks and keeps the token refiner
+resident on the device.
+
 Run the validation on two Hopper GPUs with FA4 `4.0.0b33`:
 
 ```bash
@@ -132,14 +190,24 @@ and cover eager/regional execution with no, model, and layerwise offloading.
 
 ## Current validation
 
-Ulysses and offloading: all six Cosmos3 cases and five MiniMax H3 cases passed
+After merging `main` at `a3d7a0444`, validation on one GH200 with the
+vLLM-Omni `0.31.0rc1` ARM64 image and FA4 `4.0.0b33` passed 761 distinct tests
+across the regression suite and focused reruns. Coverage includes sparse
+selection/adapters, configuration, capability queries, sequence-parallel hooks,
+Cosmos3/MiniMax integration, and single-GPU model/layerwise offloading. Eight
+tests skipped: six require two GPUs and two concern unavailable MiniMax APIs.
+Two-rank execution was not rerun after this merge; the following distributed
+results describe the earlier foundation revision.
+
+Before integration with `main` at `a3d7a0444`, all six Cosmos3 cases and five
+MiniMax H3 Ulysses/offloading cases passed
 on Hopper GPUs with FA4 `4.0.0b33`. Coverage includes standalone model and
 layerwise CPU offloading, two-rank Ulysses with each offload mode, and eager and
 regional compilation. These tests use small randomly initialized models, not
 full checkpoints. Test lengths exceed the selector's minimum retained-block
 budget, so the parity checks exercise actual sparse selection.
 
-Validation used the vLLM-Omni 0.30.0 image, published FA4 `4.0.0b33`,
+The earlier adapter validation used the vLLM-Omni 0.30.0 image, published FA4 `4.0.0b33`,
 PyTorch `2.13.0+cu130` and CuTe DSL `4.7.1`.
 
 | GPU | Results | Sparse block size |
@@ -198,6 +266,17 @@ parallel modes are unsupported. Diffusers
 rejects sparse configurations before loading weights; sparse execution needs a
 native model integration.
 
-Checkpoint generation quality and end-to-end latency remain unqualified.
-A separate attention-strategies RFC will follow for mixing dense and sparse
-attention across roles, layers, and denoising steps to improve quality.
+Full-checkpoint generation quality remains unqualified for these static recipes.
+The [Cosmos3 strategy PoC (#8583)](https://github.com/vllm-project/vllm-omni/pull/8583)
+reports preliminary generation latency with the pinned wheel for one prompt and
+seed; it does not establish general quality preservation or distributed throughput.
+
+The [upstream MiniMax H3 evaluation](https://www.lmsys.org/blog/2026-08-27-minimax-h3-h200)
+motivates a mixed schedule: ten initial dense steps followed by SubBlock with
+64×64 blocks. Its measured speed/similarity trade-off is upstream evidence, not
+validation of this port's always-sparse recipes or of other block geometries.
+Follow-up qualification should compare matched dense and mixed generations with
+the pinned wheel, fixed prompts/inputs and seeds, viewable outputs, similarity
+measurements, and repeated generation latency. Record conditioning-token pruning
+and qualify Cosmos3 and each advertised geometry separately. Neither universal
+quality preservation nor the necessity of a mixed schedule is claimed.

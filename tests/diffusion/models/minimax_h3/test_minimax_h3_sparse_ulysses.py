@@ -175,7 +175,10 @@ def _run_case(rank, degree, offload_mode):
             offloader.enable(pipeline)
             assert offloader.enabled
             if offload_mode == "layerwise":
-                assert len(offloader._dit_hooks) == 3  # Two DiT blocks plus token refiner.
+                assert len(offloader._dit_hooks) == len(model.blocks)
+                # Ordinary layerwise offload keeps non-DiT-block state resident;
+                # only distributed layerwise offload streams nested submodules.
+                assert all(p.device == device for p in model.token_refiner.parameters())
         dispatch = BlockSparseAttention._dispatch_request
         sparse_calls = []
 
