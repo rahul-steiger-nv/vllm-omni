@@ -56,7 +56,7 @@ def _configuration(degree):
                 }
             },
         ),
-        parallel_config=DiffusionParallelConfig(ulysses_degree=degree),
+        parallel_config=DiffusionParallelConfig(ulysses_degree=degree, data_parallel_size=1),
         dtype=torch.bfloat16,
         diffusion_kv_cache_dtype=None,
         num_gpus=degree,

@@ -730,6 +730,10 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
         fake_download,
     )
 
+    # The pipeline download is mocked above; config normalization must not
+    # independently resolve the gated repository through the local HF cache.
+    monkeypatch.setattr("vllm_omni.diffusion.data.get_model_path", lambda model, revision: model)
+
     od_config = OmniDiffusionConfig(
         model="MiniMaxAI/MiniMax-H3",
         trust_remote_code=trust_remote_code,
@@ -3617,6 +3621,9 @@ def test_unpadded_sage_token_refiner_preserves_legacy_dispatch(monkeypatch):
         ).transpose(1, 2)
 
     monkeypatch.setattr(sage_attn, "sageattn", sage_kernel)
+    # The custom-op boundary imports the optional package at execution time.
+    # Replace that package too, so this CPU dispatch test needs no Sage install.
+    monkeypatch.setitem(sys.modules, "sageattention", SimpleNamespace(sageattn=sage_kernel))
     cfg = SimpleNamespace(
         diffusion_attention_config=config,
         parallel_config=SimpleNamespace(ring_degree=1),

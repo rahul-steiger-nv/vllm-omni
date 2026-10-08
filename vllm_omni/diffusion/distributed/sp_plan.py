@@ -228,6 +228,11 @@ class SequenceParallelInput:
         mask_free_padding: The consumer removes synthetic padding before attention
             and restores it before reverse communication. Skip the backend mask
             requirement only under this explicit model contract.
+        clone_shard: If True, give a sharded tensor its own contiguous storage
+            so it does not retain the full input allocation. Applies to both
+            padded and unpadded splits; a single-rank input is returned unchanged.
+            Memory savings require the caller to drop its reference to the full
+            tensor; any other references to its storage also keep it allocated.
         shard_group: Optional key shared by tensors representing the same global
             sequence. Keyed groups track independent padding metadata; omitting
             it preserves the legacy single-sequence padding behavior.
@@ -247,6 +252,7 @@ class SequenceParallelInput:
     expected_dims: int | None = None
     split_output: bool = False
     auto_pad: bool = False
+    clone_shard: bool = False
     shard_group: str | None = None
     mask_free_padding: bool = False
 
@@ -254,7 +260,8 @@ class SequenceParallelInput:
         return (
             f"SequenceParallelInput(split_dim={self.split_dim}, "
             f"expected_dims={self.expected_dims}, split_output={self.split_output}, "
-            f"auto_pad={self.auto_pad}, shard_group={self.shard_group!r})"
+            f"auto_pad={self.auto_pad}, clone_shard={self.clone_shard}, "
+            f"shard_group={self.shard_group!r})"
         )
 
 
