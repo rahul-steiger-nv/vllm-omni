@@ -35,3 +35,12 @@ def test_unvalidated_parallel_combinations_are_rejected(options):
     parallel = SimpleNamespace(**{"ulysses_degree": 2, "sequence_parallel_size": 2, **options})
     with pytest.raises(ValueError, match="Ulysses"):
         validate_block_sparse_parallel(SimpleNamespace(parallel_config=parallel))
+
+
+def test_ulysses_allgather_config_remains_unsupported_for_sparse_attention():
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+    parallel = DiffusionParallelConfig(ulysses_degree=2, allgather_degree=2)
+    assert parallel.sequence_parallel_size == 4
+    with pytest.raises(ValueError, match="Ulysses"):
+        validate_block_sparse_parallel(SimpleNamespace(parallel_config=parallel))
