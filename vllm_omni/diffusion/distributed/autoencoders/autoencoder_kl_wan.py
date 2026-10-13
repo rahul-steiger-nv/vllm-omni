@@ -222,6 +222,10 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
 
 
 class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
+    # Runtime-only spatial decode setting; checkpoint configuration is unchanged.
+    # Values above one trade memory and convolution rounding for fewer launches.
+    spatial_temporal_chunk_size: int | None = None
+
     @classmethod
     def from_pretrained(cls, *args: Any, **kwargs: Any):
         model = super().from_pretrained(*args, **kwargs)
@@ -534,6 +538,7 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
                 group=self.distributed_executor.group,
                 return_dict=return_dict,
                 split_dim=split_dim,
+                temporal_chunk_size=self.spatial_temporal_chunk_size,
             )
         return self._tile_parallel_decode(z, return_dict=return_dict)
 
@@ -577,6 +582,7 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
             return_dict=True,
             split_dim=split_dim,
             on_chunk=on_chunk,
+            temporal_chunk_size=self.spatial_temporal_chunk_size,
         )
 
     def tiled_encode(self, x: torch.Tensor) -> torch.Tensor:
