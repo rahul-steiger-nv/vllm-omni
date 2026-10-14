@@ -921,7 +921,7 @@ def install_wan_spatial_shard_decode(
     convolutions/padding for halo-exchanging variants and wrapping
     ``decoder.forward``. The patch is permanent for the lifetime of the VAE
     instance and is applied only once (subsequent calls are no-ops). A given
-    instance is bound to a single ``split_dim`` and ``dst``; switching either
+    instance is bound to a single ``group``, ``split_dim`` and ``dst``; switching any
     requires a fresh VAE instance and raises here otherwise.
 
     With ``dst=0`` (the default) only group-relative rank 0 assembles the
@@ -948,6 +948,11 @@ def install_wan_spatial_shard_decode(
             raise ValueError(
                 "Wan spatial-shard VAE decoder was already patched to assemble on "
                 f"{installed_dst!r}; create a fresh VAE instance to assemble on {dst!r}."
+            )
+        if getattr(vae, "_vllm_omni_wan_spatial_shard_group", None) is not group:
+            raise ValueError(
+                "Wan spatial-shard VAE decoder was already patched for a different process group; "
+                "create a fresh VAE instance to change groups."
             )
         return
     decoder = getattr(vae, "decoder", None)
@@ -1024,6 +1029,7 @@ def install_wan_spatial_shard_decode(
     vae._vllm_omni_wan_spatial_shard_installed = True
     vae._vllm_omni_wan_spatial_shard_split_dim = split_dim
     vae._vllm_omni_wan_spatial_shard_dst = dst
+    vae._vllm_omni_wan_spatial_shard_group = group
     if fast_level is not None:
         install_wan_vae_fastpath(vae, level=fast_level)
     logger.info("Installed Wan VAE %s-sharded decode.", split_dim)
