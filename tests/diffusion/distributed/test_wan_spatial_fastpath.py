@@ -116,6 +116,16 @@ def test_spatial_fastpath_parity_and_lifecycle(axis, level, variant, dtype):
             assert torch.equal(torch.cat(chunks, dim=2), actual)
         else:
             assert not chunks
+        # A subsequent small request takes ordinary temporal dispatch, while
+        # the decoder remains spatially patched and only rank 0 owns output.
+        candidate.enable_tiling()
+        assert height <= candidate.tile_sample_min_height // candidate.spatial_compression_ratio
+        assert width <= candidate.tile_sample_min_width // candidate.spatial_compression_ratio
+        small = candidate.decode(z).sample
+        if dist.get_rank() == 0:
+            torch.testing.assert_close(small, one_frame, atol=0.04 if dtype == torch.bfloat16 else 1e-4, rtol=0)
+        else:
+            assert small.shape == (0,)
     wrapper = candidate.decoder.forward
     uninstall_wan_vae_fastpath(candidate)
     assert candidate.decoder.forward is wrapper

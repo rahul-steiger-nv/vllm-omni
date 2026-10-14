@@ -124,7 +124,13 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
         return_dict: bool = True,
     ):
         """Decode the non-tiled temporal path, optionally streaming chunks."""
-        if on_chunk is None and is_installed(self) and not torch.is_grad_enabled():
+        spatial = getattr(self, "_vllm_omni_wan_spatial_shard_installed", False)
+        produce_output = True
+        if spatial:
+            dst = self._vllm_omni_wan_spatial_shard_dst
+            group = self._vllm_omni_wan_spatial_shard_group
+            produce_output = dst is None or dist.get_rank(group=group) == dst
+        if on_chunk is None and produce_output and is_installed(self) and not torch.is_grad_enabled():
             try:
                 out = decode_frames(self, z)
             finally:
@@ -154,6 +160,11 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
                         feat_idx=self._conv_idx,
                     )
 
+                # The permanent spatial wrapper returns a 1D placeholder on
+                # non-owner ranks, including below the tiling threshold. Keep
+                # participating in every chunk's collectives without assembling it.
+                if not produce_output:
+                    continue
                 if on_chunk is None:
                     decoded_chunks.append(chunk)
                     continue
@@ -174,6 +185,9 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
                 raise callback_error
             if on_chunk is not None:
                 return None
+            if not produce_output:
+                out = z.new_zeros(0)
+                return DecoderOutput(sample=out) if return_dict else (out,)
 
             out = torch.cat(decoded_chunks, dim=2)
             if self.config.patch_size is not None:

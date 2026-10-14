@@ -75,6 +75,50 @@ def test_slicing_and_forward_hooks(vae):
         handle.remove()
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("dst", [0, 1, None])
+@pytest.mark.parametrize("fast_path", [False, True])
+@pytest.mark.parametrize("return_dict", [False, True])
+@torch.no_grad()
+def test_small_decode_after_spatial_install(vae, monkeypatch, rank, dst, fast_path, return_dict):
+    from vllm_omni.diffusion.distributed.autoencoders import autoencoder_kl_wan as wan
+
+    z = torch.randn(1, 2, 3, 2, 2)
+    expected = vae.decode(z).sample
+    vae.enable_tiling()
+    group = object()
+    monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (rank, 2))
+    monkeypatch.setattr(wan.dist, "get_rank", lambda group: rank)
+    monkeypatch.setattr(wan_spatial_shard, "_patch_decoder_modules", lambda *args: None)
+    monkeypatch.setattr(wan_spatial_shard, "split_for_parallel_decode", lambda x, **kwargs: (x, x.shape[-2]))
+    gathers = []
+    produce_output = dst is None or rank == dst
+
+    def gather(x, **kwargs):
+        gathers.append(x.shape)
+        return x if produce_output else x.new_zeros(0)
+
+    monkeypatch.setattr(wan_spatial_shard, "gather_and_trim_extent", gather)
+    wan_spatial_shard.install_wan_spatial_shard_decode(vae, group, dst=dst)
+    monkeypatch.setattr(wan, "is_installed", lambda vae: fast_path)
+    actual = vae.decode(z, return_dict=return_dict)
+    actual = actual.sample if return_dict else actual[0]
+    assert len(gathers) == z.shape[2]
+    if produce_output:
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    else:
+        assert actual.shape == (0,)
+    assert all(entry is None for entry in vae._feat_map)
+    gathers.clear()
+    chunks: list[torch.Tensor] = []
+    vae.decode_with_chunks(z, on_chunk=chunks.append)
+    assert len(gathers) == z.shape[2]
+    if produce_output:
+        torch.testing.assert_close(torch.cat(chunks, dim=2), expected, rtol=0, atol=0)
+    else:
+        assert chunks == []
+
+
 @torch.no_grad()
 def test_callback_failure_drains_and_clears_cache(vae):
     z = torch.randn(1, 2, 4, 2, 2)
