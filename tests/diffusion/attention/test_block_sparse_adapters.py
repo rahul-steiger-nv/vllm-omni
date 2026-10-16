@@ -8,11 +8,16 @@ import pytest
 import torch
 
 from tests.helpers.block_sparse import make_attention_inputs, selected_attention_reference
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.diffusion.attention.block_selection.abstract import BlockSelection
 from vllm_omni.diffusion.attention.capabilities import CompilationMode
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cuda]
+pytestmark = [
+    pytest.mark.diffusion,
+    pytest.mark.core_model,
+    *hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=1),
+]
 
 
 @pytest.fixture(params=["FLASH_ATTN"])

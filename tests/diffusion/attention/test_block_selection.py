@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from tests.helpers.block_sparse import make_attention_inputs
+from tests.helpers.mark import hardware_test
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
 
@@ -22,7 +23,7 @@ def cuda_selector():
 
 
 @pytest.mark.parametrize("batch,kv_heads", [(1, 4), (2, 2)])
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @torch.inference_mode()
 def test_gqa_routing_and_prefix(cuda_selector, batch, kv_heads):
     from vllm_omni.diffusion.attention.block_selection.subblock_topk import SubBlockTopK
@@ -47,7 +48,7 @@ def test_gqa_routing_and_prefix(cuda_selector, batch, kv_heads):
         selector.select(q, k[:, :0], 0.1, 0)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("head_size", [8, 64, 96, 128, 192, 256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @torch.inference_mode()
@@ -83,7 +84,7 @@ def test_pooling_and_scores_against_reference(cuda_selector, head_size, dtype):
     torch.testing.assert_close(scores, reference, atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize(
     "sparsity,kv_len,prefix,kept",
     [(0.0, 1089, 0, 18), (0.75, 257, 0, 5), (0.75, 1089, 1089, 18), (0.75, 1089, 1025, 18)],
@@ -112,7 +113,7 @@ def test_known_selection_skips_scoring(cuda_selector, monkeypatch, sparsity, kv_
         torch.testing.assert_close(actual.counts, selection.counts, atol=0, rtol=0)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("prefix", [0, 64, 65, 2048])
 @torch.inference_mode()
 def test_prefix_does_not_consume_candidate_budget(cuda_selector, prefix):
@@ -149,7 +150,7 @@ def test_cosmos3_prefix_budget(prefix, retained):
     assert prefix_blocks + SubBlockTopK.block_budget(301 - prefix_blocks, 0.75) == retained
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize(
     "kv_heads,block_size,prefix,sparsity",
     [
@@ -174,6 +175,7 @@ def test_pinned_routing_reference(cuda_selector, kv_heads, block_size, prefix, s
     torch.testing.assert_close(actual.counts, expected.counts, atol=0, rtol=0)
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     "candidates,sparsity,expected", [(0, 0.75, 0), (3, 0.75, 3), (64, 0.75, 16), (292, 0.75, 80), (301, 0.75, 80)]
 )
@@ -183,7 +185,7 @@ def test_candidate_budget_without_gpu(candidates, sparsity, expected):
     assert SubBlockTopK.block_budget(candidates, sparsity) == expected
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("sparsity", [0.75, 0.95, 0.98])
 @torch.inference_mode()
 def test_pinned_routing_ties_and_high_sparsity(cuda_selector, sparsity):
@@ -202,7 +204,7 @@ def test_pinned_routing_ties_and_high_sparsity(cuda_selector, sparsity):
     torch.testing.assert_close(actual.counts, expected.counts, atol=0, rtol=0)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("kind", ["nan", "mixed", "positive_inf", "negative_inf", "extreme_finite"])
 @torch.inference_mode()
 def test_nonfinite_score_rows_have_complete_unique_selection(cuda_selector, kind):
@@ -226,7 +228,7 @@ def test_nonfinite_score_rows_have_complete_unique_selection(cuda_selector, kind
     torch.testing.assert_close(actual[1:], _fused_topk(scores[1:].contiguous(), 8))
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @torch.inference_mode()
 def test_finite_input_pooling_overflow_has_valid_counts_and_prefix(cuda_selector):
     from vllm_omni.diffusion.attention.block_selection.subblock_topk import SubBlockTopK

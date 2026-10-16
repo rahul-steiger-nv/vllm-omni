@@ -7,7 +7,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cuda]
+from tests.helpers.mark import hardware_test
+
+pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
 
 
 @pytest.fixture(autouse=True)
@@ -40,6 +42,7 @@ def move_inputs(values, device):
     }
 
 
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @torch.inference_mode()
 def test_sparse_head_shards_and_padding_on_one_gpu(monkeypatch):
     """Validate the sparse math separately from the two-GPU communication gate."""
@@ -393,6 +396,7 @@ def _worker(rank, offload_mode, init_method, degree=2):
             parallel_state.destroy_distributed_env()
 
 
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parallel
 @pytest.mark.parametrize("offload_mode", ["none", "model", "layerwise"])
 def test_static_sparse_ulysses_two_rank_parity(tmp_path, offload_mode):
@@ -407,6 +411,7 @@ def test_static_sparse_ulysses_two_rank_parity(tmp_path, offload_mode):
     )
 
 
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("offload_mode", ["model", "layerwise"])
 def test_static_sparse_offloading(tmp_path, offload_mode):
     _worker(0, offload_mode, f"file://{tmp_path / 'rendezvous'}", degree=1)

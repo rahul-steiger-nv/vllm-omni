@@ -8,7 +8,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cuda]
+from tests.helpers.mark import hardware_test
+
+pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
 
 
 @pytest.fixture(autouse=True)
@@ -250,11 +252,13 @@ def _worker(rank, offload_mode, init_method):
         parallel_state.destroy_distributed_env()
 
 
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("offload_mode", ["model", "layerwise"])
 def test_sparse_offloading(offload_mode):
     _run_case(0, 1, offload_mode)
 
 
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parallel
 @pytest.mark.parametrize("offload_mode", ["none", "model", "layerwise"])
 def test_sparse_ulysses_offloading(tmp_path, offload_mode):

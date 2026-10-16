@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from tests.helpers.block_sparse import make_attention_inputs, selected_attention_reference
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, PackedPaddingMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
 from vllm_omni.diffusion.attention.capabilities import (
@@ -26,6 +27,7 @@ from vllm_omni.diffusion.data import (
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
 
 
+@pytest.mark.cpu
 def test_inline_configuration(monkeypatch):
     monkeypatch.setenv("DIFFUSION_ATTENTION_BACKEND", "TORCH_SDPA")
     config = build_attention_config(
@@ -61,6 +63,7 @@ def test_inline_configuration(monkeypatch):
         AttentionConfig(default={"name": "block_sparse", "backend": "FLASH_ATTN"})
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     "config",
     [
@@ -116,7 +119,7 @@ def make_impl(heads=4, kv_heads=2, sparsity=0.75, block_size=(64, 64), head_size
     )
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @torch.inference_mode()
 def test_selected_key_numerics_and_compile(hopper):
     kv_heads = 2
@@ -141,7 +144,7 @@ def test_selected_key_numerics_and_compile(hopper):
     assert result.compilation_mode is CompilationMode.CUSTOM_OP
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @torch.inference_mode()
 def test_capability_rejections(hopper):
     impl = make_impl()
@@ -170,7 +173,7 @@ def test_capability_rejections(hopper):
         impl.forward_cuda(q, k.repeat_interleave(2, 2), v.repeat_interleave(2, 2))
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @torch.inference_mode()
 def test_full_attention_layer_prepares_inline_spec(hopper, monkeypatch):
     from types import SimpleNamespace
@@ -212,6 +215,7 @@ def test_full_attention_layer_prepares_inline_spec(hopper, monkeypatch):
     torch.testing.assert_close(torch.compile(layer, fullgraph=True)(q, k, k, None), actual, atol=0, rtol=0)
 
 
+@pytest.mark.cpu
 def test_checkpoint_calibration_preserves_block_sparse_spec():
     from types import SimpleNamespace
 
@@ -222,6 +226,7 @@ def test_checkpoint_calibration_preserves_block_sparse_spec():
     assert isinstance(cfg.diffusion_attention_config.default, BlockSparseAttentionSpec)
 
 
+@pytest.mark.cpu
 def test_provider_neutral_config_and_missing_adapter():
     from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
 
@@ -249,6 +254,7 @@ def test_provider_neutral_config_and_missing_adapter():
         get_attn_backend_for_role("self", 128, cfg)
 
 
+@pytest.mark.cpu
 def test_new_provider_adapter_receives_opaque_id(monkeypatch):
     from vllm_omni.diffusion.attention import selector
     from vllm_omni.diffusion.attention.backends.flashinfer_attn import FlashInferAttentionBackend
@@ -293,6 +299,7 @@ def test_new_provider_adapter_receives_opaque_id(monkeypatch):
         selector.get_attn_backend_for_role("self", 128, cfg)
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("providers", [[], ["FLASH_ATTN"], ["FLASH_ATTN", "FLASHINFER_ATTN"]])
 @pytest.mark.parametrize("location", ["default", "per_role"])
 def test_provider_preference_is_rejected_before_loading(monkeypatch, providers, location):
@@ -308,6 +315,7 @@ def test_provider_preference_is_rejected_before_loading(monkeypatch, providers, 
         AttentionConfig(**config)
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("error_type", [ImportError, ValueError, RuntimeError])
 def test_pinned_provider_errors_propagate(monkeypatch, error_type):
     from vllm_omni.diffusion.attention.backends.flash_attn import FA4SparseAdapter
@@ -325,7 +333,7 @@ def test_pinned_provider_errors_propagate(monkeypatch, error_type):
     assert caught.value is error
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("block_size,kv_heads", [((64, 128), 2), ((128, 64), 4), ((128, 128), 2), ((256, 128), 4)])
 @torch.inference_mode()
 def test_direct_larger_geometry(hopper, monkeypatch, block_size, kv_heads):
@@ -376,7 +384,7 @@ def test_direct_larger_geometry(hopper, monkeypatch, block_size, kv_heads):
     assert observed
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @torch.inference_mode()
 def test_geometry_rejection_is_owned_by_strategy(hopper):
     # Positive geometry is accepted by the schema; constraints belong to execution.
@@ -386,6 +394,7 @@ def test_geometry_rejection_is_owned_by_strategy(hopper):
         make_impl(block_size=(96, 128))
 
 
+@pytest.mark.cpu
 def test_adapter_preparation_does_not_probe_synthetic_shapes(monkeypatch):
     from vllm_omni.diffusion.attention.backends.flash_attn import FA4SparseAdapter
 
@@ -408,7 +417,7 @@ def isolated_compile_cache():
     torch.compiler.reset()
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize(
     "head_size,value_size,dtype,kv_heads",
     [
@@ -437,7 +446,7 @@ def test_actual_request_dimensions_and_dtype(hopper, isolated_compile_cache, hea
         torch.testing.assert_close(compiled(q, k, v, metadata), actual, atol=0, rtol=0)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("compiled", [False, True])
 @torch.inference_mode()
 def test_provider_rejection_propagates_during_preparation(hopper, isolated_compile_cache, monkeypatch, compiled):
@@ -462,7 +471,7 @@ def test_provider_rejection_propagates_during_preparation(hopper, isolated_compi
     assert "provider rejected actual request" in failed.support.reason
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("change", ["length", "strides", "dtype", "value_size", "prefix"])
 @torch.inference_mode()
 def test_eager_preparation_is_specific_to_request(hopper, change):
@@ -490,7 +499,7 @@ def test_eager_preparation_is_specific_to_request(hopper, change):
     assert impl.resolve_execution_path(context, q, k, v, metadata).support.status is SupportStatus.SUPPORTED
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("failure_stage", ["execute", "synchronize"])
 @torch.inference_mode()
 def test_preparation_failure_is_recorded_and_retryable(hopper, monkeypatch, failure_stage):
@@ -515,7 +524,7 @@ def test_preparation_failure_is_recorded_and_retryable(hopper, monkeypatch, fail
     assert impl.resolve_execution_path(context, q, k, v, None).support.status is SupportStatus.SUPPORTED
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @torch.inference_mode()
 def test_dynamic_compilation_does_not_specialize_prepared_geometry(hopper, isolated_compile_cache):
     from torch._dynamo.testing import CompileCounterWithBackend
@@ -540,7 +549,7 @@ def test_dynamic_compilation_does_not_specialize_prepared_geometry(hopper, isola
     assert counter.frame_count == 1
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("kv_heads", [1, 2, 4])
 @torch.inference_mode()
 def test_fa4_dynamic_adapter_preserves_changing_selections(hopper, isolated_compile_cache, kv_heads):
@@ -589,7 +598,7 @@ def test_fa4_dynamic_adapter_preserves_changing_selections(hopper, isolated_comp
     assert counter.frame_count == 1
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("fullgraph", [False, True])
 @torch.inference_mode()
 def test_compiled_first_request_prepares_without_graph_break(hopper, isolated_compile_cache, fullgraph):
@@ -607,6 +616,7 @@ def test_compiled_first_request_prepares_without_graph_break(hopper, isolated_co
     assert counter.frame_count == 1
 
 
+@pytest.mark.cpu
 def test_sparse_preflight_does_not_inherit_dense_provider_capabilities():
     from vllm_omni.diffusion.attention.block_sparse import BlockSparseAttention, BlockSparseBackend
     from vllm_omni.diffusion.attention.selector import get_attn_backend_for_capability
@@ -631,7 +641,7 @@ def test_sparse_preflight_does_not_inherit_dense_provider_capabilities():
     assert dense.supports_piecewise_spans and dense.supports_paged_kv
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("fullgraph", [False, True])
 @torch.inference_mode()
 def test_regional_compilation_reuses_graph_across_sparse_owners(hopper, isolated_compile_cache, fullgraph):
@@ -700,7 +710,7 @@ def make_padded_request(q_length=65, kv_length=1089, prefix=65):
     return q, k, v, metadata
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("q_length,kv_length,prefix", [(65, 1089, 65), (97, 2051, 0)])
 @torch.inference_mode()
 def test_single_document_padding_preserves_routing_and_zeroes_tail(hopper, q_length, kv_length, prefix):
@@ -731,7 +741,7 @@ def test_single_document_padding_preserves_routing_and_zeroes_tail(hopper, q_len
     assert torch.count_nonzero(extended[:, q_length:]) == 0
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @torch.inference_mode()
 def test_padding_preparation_uses_executed_views(hopper):
     impl = make_impl()
@@ -773,7 +783,7 @@ def test_padding_preparation_uses_executed_views(hopper):
     )
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("field", ["q_length", "kv_length"])
 @pytest.mark.parametrize("bad_length", [True, 1.5, 0, -1, None, "cpu_scalar", "cuda_scalar", "overflow"])
 @torch.inference_mode()
@@ -800,7 +810,7 @@ def test_padding_rejects_invalid_host_lengths(hopper, field, bad_length, monkeyp
     assert not impl._request_preparation
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize(
     "case",
     [
@@ -858,7 +868,7 @@ def test_padding_rejects_inconsistent_or_unsupported_metadata(hopper, case, monk
     assert not impl._request_preparation
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @torch.inference_mode()
 def test_padding_compile(hopper, isolated_compile_cache):
     impl = make_impl()
@@ -889,7 +899,7 @@ def test_padding_compile(hopper, isolated_compile_cache):
     assert torch.count_nonzero(actual[:, 64:]) == 0
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @torch.inference_mode()
 def test_cloned_sparse_layer_requires_own_preparation(hopper):
     import copy
@@ -912,6 +922,7 @@ def test_cloned_sparse_layer_requires_own_preparation(hopper):
     assert cloned.resolve_execution_path(context, q, k, v, None).support.status is SupportStatus.SUPPORTED
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("adapter_mode", [CompilationMode.EAGER_ONLY, CompilationMode.TRACEABLE])
 def test_shared_compilation_boundary_is_custom_op(adapter_mode):
     from types import SimpleNamespace
@@ -930,7 +941,7 @@ def test_shared_compilation_boundary_is_custom_op(adapter_mode):
     assert result.compilation_mode is CompilationMode.CUSTOM_OP
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @torch.inference_mode()
 def test_sparse_ulysses_head_geometry_and_replicated_execution(hopper, monkeypatch):
     from types import SimpleNamespace
