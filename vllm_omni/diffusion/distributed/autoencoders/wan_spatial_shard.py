@@ -534,6 +534,39 @@ class WanDistConv2d(nn.Conv2d):
             local_extent = x.shape[self.split_tensor_dim]
         return _spatial_conv_forward(self, x_padded, local_extent, return_bias=return_bias)
 
+    def forward_upsampled(
+        self, x: torch.Tensor, *, return_bias: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None] | None:
+        """Fuse nearest-2x input assembly, or decline without running convolution."""
+        if (
+            torch.is_grad_enabled()
+            or torch.compiler.is_compiling()
+            or not x.is_cuda
+            or x.ndim != 4
+            or x.dtype != torch.bfloat16
+            or x.numel() == 0
+            or not x.is_contiguous(memory_format=torch.channels_last)
+            or self.input_memory_format != torch.channels_last
+            or self.kernel_size != (3, 3)
+            or self.stride != (1, 1)
+            or self.dilation != (1, 1)
+            or (self.split_pad_left, self.split_pad_right) != (1, 1)
+            or self._non_split_padding != ((0, 0, 1, 1) if self.split_dim == "width" else (1, 1, 0, 0))
+        ):
+            return None
+        rank, world_size = _rank_world(self.group)
+        if world_size < 2:
+            return None
+        from .wan_vae_fastpath.triton_upsample import upsample_nearest_2x_padded
+
+        batch, channels, height, width = x.shape
+        buf = _persistent_input_buffer(self, (batch, channels, 2 * height + 2, 2 * width + 2), x)
+        if not upsample_nearest_2x_padded(x, buf):
+            return None
+        _exchange_input_halos(self, buf, 1, rank, world_size)
+        local_extent = 2 * (width if self.split_dim == "width" else height)
+        return _spatial_conv_forward(self, buf, local_extent, return_bias=return_bias)
+
     def _assemble_input(self, x: torch.Tensor) -> tuple[torch.Tensor, int]:
         """Copy the activation and received halos into one reusable padded input."""
         left, right, top, bottom = self._non_split_padding

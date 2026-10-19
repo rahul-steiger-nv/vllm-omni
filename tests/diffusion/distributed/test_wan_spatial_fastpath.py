@@ -239,3 +239,135 @@ def test_local_attention_queries_with_uneven_and_empty_shards(axis, dtype, shape
             assert torch.count_nonzero(actual.narrow(dim, valid, local.shape[dim] - valid)) == 0
     finally:
         spatial._SPATIAL_SHARD_CONTEXT.reset(token)
+
+
+@pytest.mark.parametrize("axis", ["height", "width"])
+@pytest.mark.parametrize("uneven", [False, True])
+@torch.inference_mode()
+def test_spatial_shortcut_bias_residual_fusion(axis, uneven, monkeypatch):
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanResidualBlock
+
+    from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard as spatial
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import forwards as fp
+
+    torch.manual_seed(83)
+    block = WanResidualBlock(128, 64, dropout=0.0).eval().to(device="cuda", dtype=torch.bfloat16)
+    for name in ("conv1", "conv2", "conv_shortcut"):
+        source = getattr(block, name)
+        source.bias.copy_(torch.randn_like(source.bias))
+        conv = spatial.WanDistCausalConv3d(source, dist.group.WORLD, split_dim=axis)
+        conv.input_memory_format = torch.channels_last_3d
+        conv.to(memory_format=torch.channels_last_3d)
+        setattr(block, name, conv)
+    setattr(block, fp.CFG_ATTR, fp.FastPathConfig(channels_last=True))
+    x = torch.randn(2, 128, 2, 6, 6, device="cuda", dtype=torch.bfloat16)
+    x = x.contiguous(memory_format=torch.channels_last_3d)
+    token = spatial._SPATIAL_SHARD_CONTEXT.set(
+        spatial.SpatialShardContext(11 if uneven else 12, 6, axis, dist.get_rank(), 2)
+    )
+    observed = []
+    original_add = fp._residual_add
+
+    def capture(x, bias_x, h, bias_h):
+        observed.append(bias_h)
+        return original_add(x, bias_x, h, bias_h)
+
+    monkeypatch.setattr(fp, "_residual_add", capture)
+    try:
+        # A hook forces the original shortcut path and observes its biased output.
+        hooked = []
+        hook = block.conv_shortcut.register_forward_hook(lambda m, args, out: hooked.append(out.clone()))
+        expected = fp.residual_block_forward(block, x, feat_cache=[None, None], feat_idx=[0])
+        hook.remove()
+        assert len(hooked) == 1 and observed[-1] is None
+        actual = fp.residual_block_forward(block, x, feat_cache=[None, None], feat_idx=[0])
+        assert torch.equal(actual, expected)
+        masked = uneven and dist.get_rank() == 1
+        assert (observed[-1] is None) == masked
+        if masked:
+            dim = spatial._spatial_dim(axis)
+            assert torch.count_nonzero(actual.narrow(dim, 5, 1)) == 0
+    finally:
+        spatial._SPATIAL_SHARD_CONTEXT.reset(token)
+
+
+@pytest.mark.parametrize("axis", ["height", "width"])
+@pytest.mark.parametrize("shape", [(1, 64, 1, 1), (2, 64, 7, 9)])
+@torch.inference_mode()
+def test_fused_bf16_upsample_spatial_conv(axis, shape):
+    from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard as spatial
+
+    torch.manual_seed(97 + dist.get_rank())
+    source = torch.nn.Conv2d(shape[1], 32, 3, padding=1).to(device="cuda", dtype=torch.bfloat16)
+    conv = spatial.WanDistConv2d(source, dist.group.WORLD, split_dim=axis)
+    conv.input_memory_format = torch.channels_last
+    conv.to(memory_format=torch.channels_last)
+    x = torch.randn(shape, device="cuda", dtype=torch.bfloat16).contiguous(memory_format=torch.channels_last)
+    upsample = torch.nn.Upsample(scale_factor=2, mode="nearest-exact")
+    extent = shape[-1] if axis == "width" else shape[-2]
+    for uneven in (False, True):
+        token = spatial._SPATIAL_SHARD_CONTEXT.set(
+            spatial.SpatialShardContext(
+                extent * dist.get_world_size() - int(uneven), extent, axis, dist.get_rank(), dist.get_world_size()
+            )
+        )
+        try:
+            reference, _ = conv._assemble_input(upsample(x))
+            reference = reference.clone()
+            expected = conv(upsample(x))
+            actual = conv.forward_upsampled(x)
+            assert torch.equal(conv._input_buf, reference)
+            assert torch.equal(actual, expected)
+            deferred = conv.forward_upsampled(x, return_bias=True)
+            assert isinstance(deferred, tuple)
+            actual, bias = deferred
+            if bias is not None:
+                actual = actual + bias.view(1, -1, 1, 1)
+            assert torch.equal(actual, expected)
+        finally:
+            spatial._SPATIAL_SHARD_CONTEXT.reset(token)
+    assert conv.forward_upsampled(x.float()) is None
+    if not x.contiguous().is_contiguous(memory_format=torch.channels_last):
+        assert conv.forward_upsampled(x.contiguous()) is None
+    with torch.enable_grad():
+        assert conv.forward_upsampled(x) is None
+
+
+@torch.inference_mode()
+def test_resample_automatically_fuses_bf16_upsampling_and_preserves_hooks(monkeypatch):
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanResample
+
+    from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard as spatial
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import forwards as fp
+
+    torch.manual_seed(108)
+    resample = WanResample(64, mode="upsample2d").eval().to(device="cuda", dtype=torch.bfloat16)
+    conv = spatial.WanDistConv2d(resample.resample[1], dist.group.WORLD, split_dim="width")
+    conv.input_memory_format = torch.channels_last
+    conv.to(memory_format=torch.channels_last)
+    resample.resample[1] = conv
+    setattr(resample, fp.CFG_ATTR, fp.FastPathConfig(channels_last=True))
+    x = torch.randn(2, 64, 2, 7, 9, device="cuda", dtype=torch.bfloat16).contiguous(
+        memory_format=torch.channels_last_3d
+    )
+    original = conv.forward_upsampled
+    monkeypatch.setattr(conv, "forward_upsampled", lambda *a, **kw: None)
+    expected = fp.resample_forward(resample, x)
+    calls = []
+
+    def capture(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(conv, "forward_upsampled", capture)
+    assert torch.equal(fp.resample_forward(resample, x), expected)
+    assert len(calls) == 1
+    for target in (resample.resample, resample.resample[0], conv):
+        observed = []
+        hook = target.register_forward_hook(lambda m, args, output: observed.append(output.clone()))
+        try:
+            assert torch.equal(fp.resample_forward(resample, x), expected)
+            assert len(observed) == 1
+            assert len(calls) == 1
+        finally:
+            hook.remove()

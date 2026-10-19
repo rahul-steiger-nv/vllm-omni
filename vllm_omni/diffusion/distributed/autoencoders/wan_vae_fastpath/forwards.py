@@ -778,7 +778,21 @@ def resample_forward(
     frames = x.shape[2]
     x = _merge_batch_and_frames(x, channels_last=channels_last)
     pending_bias = None
+    fused = None
     if (
+        channels_last
+        and _kernels_allowed(x)
+        and type(self.resample) is nn.Sequential
+        and len(self.resample) == 2
+        and type(self.resample[0]) in (nn.Upsample, WanUpsample)
+        and _is_nearest_2x(self.resample[0])
+        and type(self.resample[1]) is WanDistConv2d
+        and not _has_forward_hooks(self.resample, *self.resample)
+    ):
+        fused = self.resample[1].forward_upsampled(x, return_bias=return_bias)
+    if fused is not None:
+        x, pending_bias = fused if return_bias else (fused, None)
+    elif (
         return_bias
         and _is_upsample_conv_pair(self.resample)
         and not _has_forward_hooks(self.resample, self.resample[1])
@@ -852,6 +866,8 @@ def residual_block_forward(
     feat_cache: list[Any] | None = None,
     feat_idx: list[int] | None = None,
 ) -> torch.Tensor:
+    from ..wan_spatial_shard import WanDistCausalConv3d
+
     if feat_idx is None:
         feat_idx = [0]
     shortcut = self.conv_shortcut
@@ -866,6 +882,16 @@ def residual_block_forward(
     ):
         residual = _conv_without_bias(shortcut, x)
         residual_bias = _deferred_conv_bias(shortcut, residual)
+    elif (
+        type(shortcut) is WanDistCausalConv3d
+        and shortcut.kernel_size == (1, 1, 1)
+        and not any(shortcut._source_padding)
+        and shortcut.bias is not None
+        and not _has_forward_hooks(shortcut)
+        and _kernels_allowed(x)
+    ):
+        # The wrapper applies bias before masking invalid shard tails.
+        residual, residual_bias = shortcut(x, return_bias=True)
     else:
         residual = shortcut(x)
     cfg = getattr(self, CFG_ATTR, None)
