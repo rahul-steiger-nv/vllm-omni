@@ -244,6 +244,12 @@ Both Conv2d and Conv3d use shared halo exchange and output masking helpers.
 The channels-last path packs both outgoing halos in one launch and scatters
 both received halos in one launch, retaining channels-last NCCL buffers. It
 also computes attention only for local queries, with full-frame keys and values.
+For eligible BF16 channels-last inputs, nearest-2x upsampling writes directly
+into the padded Conv2d input before the existing halo exchange. Spatial 1x1
+shortcut bias is folded into residual addition while retaining BF16 rounding
+and invalid-tail masking. These fusions activate automatically without extra
+configuration; unsupported inputs and modules with forward hooks retain the
+existing path.
 
 Configure temporal batching with `--vae-spatial-temporal-chunk-size` (engine
 argument and per-stage deploy key `vae_spatial_temporal_chunk_size`). When omitted,
