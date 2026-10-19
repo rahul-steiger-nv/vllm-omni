@@ -919,7 +919,7 @@ class MiniMaxH3Attention(nn.Module):
             reference_kv_layer_index=reference_kv_layer_index,
             reference_kv_compact=reference_kv_compact,
             vdn_window=vdn_window,
-            attention_layout=attention_layout,
+            **({"attention_layout": attention_layout} if attention_layout is not None else {}),
         )
         if self.vdn is not None:
             out = self.vdn.gate_softmax(out, x)
@@ -2006,7 +2006,7 @@ class MiniMaxH3DiTModel(nn.Module):
         # Keep the unsharded allocation tied to a tensor shape. A separately
         # carried symbolic local_len can lose its binding when Inductor resumes
         # compilation around layerwise offload hooks.
-        embedding_rows = local_len if local_only else x.shape[1]
+        embedding_rows = local_len if local_len != seq_len else x.shape[1]
         embeddings = torch.zeros(
             (embedding_rows, self.hidden_size),
             device=device,
