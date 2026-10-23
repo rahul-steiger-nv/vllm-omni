@@ -109,7 +109,7 @@ class FastH3CheckpointSpec:
     def check_serving_contract(self, *, partition: str, od_config: OmniDiffusionConfig) -> None:
         if partition != self.partition:
             raise ValueError(f"{self.name} requires --task-type {self.partition}")
-        if od_config.lora_path:
+        if getattr(od_config, "lora_path", None):
             raise ValueError(f"{self.name} is a full checkpoint; additional LoRA adapters are unsupported")
         attention = _resolve_dit_attention_spec(od_config)
         if _resolve_dit_attention_backend(od_config) != "FASTVIDEO_VSA":
@@ -118,8 +118,8 @@ class FastH3CheckpointSpec:
             raise ValueError(
                 f"{self.name} pins VSA sparsity={self.vsa_sparsity}; remove the fixed fastvideo_vsa_topk override"
             )
-        parallel = od_config.parallel_config
-        if parallel.ring_degree != 1 or parallel.allgather_degree != 1:
+        parallel = getattr(od_config, "parallel_config", None)
+        if any(int(getattr(parallel, key, 1) or 1) != 1 for key in ("ring_degree", "allgather_degree")):
             raise ValueError(f"{self.name} supports local attention or pure Ulysses sequence parallelism")
 
     def check_request(self, sampling: OmniDiffusionSamplingParams, *, step_execution: bool = False) -> None:
