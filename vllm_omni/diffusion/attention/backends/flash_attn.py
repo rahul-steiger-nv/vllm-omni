@@ -307,6 +307,14 @@ class FlashAttentionBackend(AttentionBackend):
         return True
 
     @classmethod
+    def supports_dense_4d_mask(cls, attention_spec: object | None = None) -> bool:
+        del attention_spec
+        # CUDA/ROCm/MUSA route masked attention through the varlen wrapper,
+        # which only accepts a 2D key-validity mask. Ascend feeds the dense
+        # block mask to npu_fusion_attention and accepts 4D directly.
+        return current_omni_platform.is_npu()
+
+    @classmethod
     def supports_cross_kv_mask(cls, attention_spec: object | None = None) -> bool:
         del attention_spec
         if not current_omni_platform.is_cuda():
@@ -522,6 +530,8 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
     def _flash_varlen_wrapper(q, k, v, *, attn_func, causal, softmax_scale, **kwargs):
         """Call a varlen-only FlashAttention backend for a dense segment."""
         del kwargs
+        from vllm_omni.diffusion.attention.backends.utils.fa import vllm_varlen_version_kwargs
+
         batch_size, q_len = q.shape[:2]
         k_len = k.shape[1]
         cu_seqlens_q = torch.arange(0, (batch_size + 1) * q_len, q_len, dtype=torch.int32, device=q.device)
@@ -536,6 +546,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             max_seqlen_k=k_len,
             causal=causal,
             softmax_scale=softmax_scale,
+            **vllm_varlen_version_kwargs(attn_func),
         )
         out = FlashAttentionImpl._unwrap_flash_output(out)
         return out.reshape(batch_size, q_len, *out.shape[1:])
@@ -553,6 +564,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             _unpad_input,
             _upad_input,
             flash_attn_varlen_func,
+            vllm_varlen_version_kwargs,
         )
 
         if flash_attn_varlen_func is None:
@@ -585,6 +597,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             **{
                 "causal": self.causal,
                 "softmax_scale": self.softmax_scale,
+                **vllm_varlen_version_kwargs(flash_attn_varlen_func),
             },
         )
         out_unpad = self._unwrap_flash_output(out_unpad)
@@ -611,6 +624,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         """
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             flash_attn_varlen_func,
+            vllm_varlen_version_kwargs,
         )
 
         if flash_attn_varlen_func is None:
@@ -628,6 +642,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             max_seqlen_k=max_seqlen_k,
             causal=self.causal,
             softmax_scale=self.softmax_scale,
+            **vllm_varlen_version_kwargs(flash_attn_varlen_func),
         )
         out = self._unwrap_flash_output(out)
         return out.reshape_as(query)
@@ -648,6 +663,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         """
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             flash_attn_varlen_func,
+            vllm_varlen_version_kwargs,
         )
 
         if flash_attn_varlen_func is None:
@@ -671,6 +687,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             max_seqlen_k=k_len,
             causal=self.causal,
             softmax_scale=self.softmax_scale,
+            **vllm_varlen_version_kwargs(flash_attn_varlen_func),
         )
         out = self._unwrap_flash_output(out)
         # (b s) h d -> b s h d
@@ -789,6 +806,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             HAS_FLASH_ATTN,
             IS_FLASH_ATTN_4,
+            dense_flash_attn_func_for,
             flash_attn_func,
             flash_attn_varlen_func,
         )
@@ -869,7 +887,10 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 attention_mask,
             )
 
-        if flash_attn_func is not None:
+        # optional_fa3_fwd_dense_func is consulted only here so masked/packed/
+        # piecewise/FP8 keep the vLLM varlen dispatcher. FP16 skips fa3-fwd.
+        dense_attn_func = dense_flash_attn_func_for(query.dtype)
+        if dense_attn_func is not None:
             if IS_FLASH_ATTN_4:
                 return _fa4_dense_attention_op(
                     query,
@@ -885,7 +906,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             }
             if self.fa_deterministic:
                 fa_kwargs["deterministic"] = True
-            out = flash_attn_func(query, key, value, **fa_kwargs)
+            out = dense_attn_func(query, key, value, **fa_kwargs)
             return self._unwrap_flash_output(out)
 
         self._warn_fa_deterministic_non_dense("dense-varlen-fallback")
@@ -1073,6 +1094,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         """XPU flash attention implementation."""
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             HAS_FLASH_ATTN,
+            flash_attn_varlen_func,
         )
 
         if not HAS_FLASH_ATTN:
@@ -1080,6 +1102,18 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 "FlashAttentionBackend requires Flash Attention. "
                 "Please assure vllm-xpu-kernels properly installed. "
                 "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
+            )
+
+        # Spans take precedence over attn_mask, matching forward_cuda.
+        if attn_metadata is not None and attn_metadata.full_attn_spans is not None:
+            return piecewise_attn(
+                query,
+                key,
+                value,
+                attn_metadata.full_attn_spans,
+                self.softmax_scale,
+                partial(FlashAttentionImpl._flash_varlen_wrapper, attn_func=flash_attn_varlen_func),
+                query_ranges=attn_metadata.query_ranges,
             )
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
