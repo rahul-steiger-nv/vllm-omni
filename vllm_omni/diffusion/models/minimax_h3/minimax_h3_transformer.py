@@ -749,9 +749,7 @@ class MiniMaxH3Attention(nn.Module):
                     and FlashAttentionBackend.supports_packed_mask_free()
                 )
             )
-            no_mask = not use_ring and (
-                attention.attn_backend.supports_prefix_kv_slicing or mask_free_packed_padding
-            )
+            no_mask = not use_ring and (attention.attn_backend.supports_prefix_kv_slicing or mask_free_packed_padding)
             # Hybrid Ulysses reshards Q to one ring partition before the ring
             # kernel runs, so a global key mask cannot pass its query-length
             # check. Ring consumes valid_kv_length directly.
