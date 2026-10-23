@@ -11,6 +11,7 @@ from tests.helpers.attention_strategy import (
     configure_strategy_test,
     move_strategy_inputs,
 )
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.forward_context import ForwardContext, override_forward_context
 
@@ -20,9 +21,9 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
 STRATEGY_EXECUTION_MODES = [
     pytest.param("cpu", "eager", "none", marks=pytest.mark.cpu),
     pytest.param("cpu", "inductor", "none", marks=pytest.mark.cpu),
-    pytest.param("cuda", "inductor", "none", marks=pytest.mark.cuda),
-    pytest.param("cuda", "inductor", "component", marks=pytest.mark.cuda),
-    pytest.param("cuda", "inductor", "layerwise", marks=pytest.mark.cuda),
+    pytest.param("cuda", "inductor", "none", marks=hardware_marks(res={"cuda": "H100"}, num_cards=1)),
+    pytest.param("cuda", "inductor", "component", marks=hardware_marks(res={"cuda": "H100"}, num_cards=1)),
+    pytest.param("cuda", "inductor", "layerwise", marks=hardware_marks(res={"cuda": "H100"}, num_cards=1)),
 ]
 
 

@@ -4071,6 +4071,7 @@ def test_minimax_sparse_recipe_constructs_model_and_dispatches(monkeypatch, sche
 
 
 @pytest.mark.parametrize("ordinary_quality", [None, "lossless"])
+@pytest.mark.cpu
 def test_strategy_rejects_resolved_quality_cache_before_hooks_and_next_request_works(monkeypatch, ordinary_quality):
     from vllm_omni.diffusion.cache.cachedit import runtime
     from vllm_omni.diffusion.data import AttentionConfig
