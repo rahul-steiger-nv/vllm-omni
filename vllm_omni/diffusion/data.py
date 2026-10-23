@@ -2546,7 +2546,7 @@ def validate_kv_cache_dtype_vs_attention_specs(
         return
     specs = [attention_config.default, *attention_config.per_role.values()]
     for spec in specs:
-        if spec is None or spec.quant is None:
+        if not isinstance(spec, AttentionSpec) or spec.quant is None:
             continue
         if spec.quant.dtype_qk is not None or spec.quant.dtype_vo is not None:
             raise ValueError(
