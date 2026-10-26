@@ -239,3 +239,50 @@ def test_causal_conv_forward_shares_spatial_padding_verdicts(cpu_assembly, monke
     # The cached call site shares the verdict instead of probing again.
     assert torch.equal(fp._run_cached_causal_conv(conv, x, [cache_x], 0), expected)
     assert comparisons == check
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("prepad", [False, True])
+def test_replaced_cache_is_released_before_convolution(cpu_assembly, monkeypatch, prepad: bool) -> None:
+    conv = fp.WanCausalConv3d(2, 2, 3, padding=1)
+    x = torch.ones(1, 2, 2, 3, 4)
+    slots = [torch.ones_like(x)]
+    old_cache = weakref.ref(slots[0])
+    key = fp._conv_verdict_key(conv, x, slots[0].shape[2])
+    monkeypatch.setattr(fp, "_SPATIAL_PAD_VERDICTS", weakref.WeakKeyDictionary({conv: {key: not prepad}}))
+    conv3d = fp.F.conv3d
+
+    def checked_conv(*args, **kwargs):
+        assert old_cache() is None, "replaced history must not overlap the convolution output"
+        assert slots[0].shape == x.shape
+        return conv3d(*args, **kwargs)
+
+    monkeypatch.setattr(fp.F, "conv3d", checked_conv)
+    output = fp._run_cached_causal_conv(conv, x, slots, 0)
+    assert output.shape == x.shape
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("channels_last,verify", [(False, True), (True, True), (True, False)])
+def test_spatial_probe_policy_preserves_exact_paths(monkeypatch, channels_last: bool, verify: bool) -> None:
+    conv = fp.WanCausalConv3d(2, 2, 3, padding=1)
+    setattr(conv, fp.CFG_ATTR, fp.FastPathConfig(channels_last=channels_last, verify_spatial_padding=verify))
+    assembled = torch.ones(1, 2, 4, 3, 4)
+    probes = []
+
+    def reject(*args):
+        probes.append(True)
+        return False
+
+    monkeypatch.setattr(fp, "_equal_on_random_operands", reject)
+    verdicts: dict[tuple[str], bool] = {}
+    output = fp._conv_with_spatial_padding(conv, assembled, conv.bias, verdicts, ("shape",))
+    if channels_last and not verify:
+        assert not probes
+        assert not verdicts
+        expected = fp.F.conv3d(assembled, conv.weight, conv.bias, padding=(0, 1, 1))
+    else:
+        assert probes == [True]
+        assert verdicts == {("shape",): False}
+        expected = fp.F.conv3d(fp.F.pad(assembled, (1, 1, 1, 1, 0, 0)), conv.weight, conv.bias)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)

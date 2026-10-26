@@ -3344,6 +3344,9 @@ class Cosmos3OmniDiffusersPipeline(
                         self._kv_capture_und(kv_state, is_negative=False)
                     _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
         finally:
+            # Conditioning is request-local and no longer needed by VAE decode.
+            # Dropping session state alone leaves these transformer aliases live.
+            self.transformer.reset_cache()
             self._clear_denoise_step_metadata()
             self._reset_mixed_precision()
             # Cosmos3 currently receives a unique request_id rather than a
