@@ -71,6 +71,15 @@ The executor is model-agnostic and accepts three function parameters:
 
 - (Optional) Broadcast final result to all ranks
 
+Packing copies decoded tiles into independent communication storage. The executor
+releases the original tile references after packing and the packed send buffer
+after gathering. Gathered storage remains live through merging because unpacked
+tiles are views into it.
+
+Wan tile decoding preserves causal feature caches between temporal chunks, then
+clears them before concatenating the tile output. Cleanup also runs if decoding
+fails, so the final tile's caches do not remain live during gathering and merging.
+
 This design separates:
 
 - Distributed execution logic

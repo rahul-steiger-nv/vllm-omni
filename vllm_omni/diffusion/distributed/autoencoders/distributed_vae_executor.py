@@ -170,10 +170,14 @@ class DistributedVaeExecutor:
             local_tile_tensor, local_meta_tensor = self._pack_local_tiles(
                 local_results, global_padding_shape, grid_spec, z.device, output_dtype
             )
+        # Packing copies each decoded tile into independent storage.
+        del local_results
 
         # 6. gather tiles & meta
         meta_gather = self.gather_tensors(local_meta_tensor)
         tile_gather = self.gather_tensors(local_tile_tensor)
+        # The synchronous collective owns separate receive buffers for merging.
+        del local_tile_tensor
 
         with self._sync_errors("tile merge"):
             if self.rank != 0:

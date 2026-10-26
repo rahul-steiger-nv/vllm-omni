@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import weakref
 from dataclasses import dataclass
 
 import pytest
@@ -174,3 +175,46 @@ def test_is_distributed_enabled():
 
     mixin.use_tiling = False
     assert mixin.is_distributed_enabled() is False
+
+
+@pytest.mark.parametrize("boundary", ["gather", "merge"])
+@pytest.mark.parametrize("return_view", [False, True])
+def test_execute_releases_copied_buffers(monkeypatch, boundary: str, return_view: bool):
+    """Copied tile/send buffers must not overlap the next allocation phase."""
+    executor = DistributedVaeExecutor()
+    executor.world_size = 1
+    decoded_refs = []
+    packed_ref = None
+
+    class Operator(E2EOperator):
+        def exec(self, task):
+            output = super().exec(task)
+            decoded_refs.append(weakref.ref(output))
+            return output
+
+        def merge(self, coord_tensor_map, grid_spec):
+            if boundary == "merge":
+                assert packed_ref is not None and packed_ref() is None
+            if return_view:
+                # The returned view must retain gathered storage independently.
+                return coord_tensor_map[(1, 2)]
+            return super().merge(coord_tensor_map, grid_spec)
+
+    def gather(tensor):
+        nonlocal packed_ref
+        if tensor.dtype == torch.float32:
+            if boundary == "gather":
+                assert decoded_refs and all(ref() is None for ref in decoded_refs)
+            packed_ref = weakref.ref(tensor)
+        # Match the collective's separate receive storage, not the aliasing
+        # fixture used by tests that do not exercise tensor lifetimes.
+        return [tensor.clone()]
+
+    monkeypatch.setattr(executor, "gather_tensors", gather)
+    output = executor.execute(torch.zeros(4, 6), Operator(), broadcast_result=False)
+    expected = (
+        torch.full((2, 2), 5.0)
+        if return_view
+        else torch.arange(6, dtype=torch.float32).reshape(2, 3).repeat_interleave(2, 0).repeat_interleave(2, 1)
+    )
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)

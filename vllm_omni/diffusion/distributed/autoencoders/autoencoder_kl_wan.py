@@ -304,12 +304,19 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
         """Decode a single latent tile into RGB space."""
         self.clear_cache()
         time = []
-        with self._execution_context():
-            for k in range(len(task.tensor)):
-                self._conv_idx = [0]
-                tile = self.post_quant_conv(task.tensor[k])
-                decoded = self.decoder(tile, feat_cache=self._feat_map, feat_idx=self._conv_idx, first_chunk=(k == 0))
-                time.append(decoded)
+        try:
+            with self._execution_context():
+                for k in range(len(task.tensor)):
+                    self._conv_idx = [0]
+                    tile = self.post_quant_conv(task.tensor[k])
+                    decoded = self.decoder(
+                        tile, feat_cache=self._feat_map, feat_idx=self._conv_idx, first_chunk=(k == 0)
+                    )
+                    time.append(decoded)
+        finally:
+            # History is needed between temporal chunks, but not during tile
+            # concatenation or the executor's subsequent packing and gather.
+            self.clear_cache()
         result = torch.cat(time, dim=2)
         return result
 
