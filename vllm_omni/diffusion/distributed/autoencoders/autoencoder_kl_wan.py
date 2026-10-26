@@ -531,6 +531,7 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
                     group=self.distributed_executor.group,
                     return_dict=return_dict,
                     split_dim=split_dim,
+                    temporal_chunk_size=self.spatial_temporal_chunk_size,
                 )
             # A partial VAE group cannot shard; keep the tile-parallel fallback even without native tiling.
             if self.is_distributed_enabled() and self._exceeds_tile(z):

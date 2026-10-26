@@ -256,6 +256,30 @@ def _bare_distributed_vae(monkeypatch, *, mode, use_tiling, world_size=2):
 
 
 @pytest.mark.parametrize("use_tiling", [True, False])
+@pytest.mark.parametrize("mode", ["spatial_shard_height", "spatial_shard_width"])
+@pytest.mark.parametrize("temporal_chunk_size", [1, 4])
+def test_decode_forwards_spatial_temporal_chunk_override(monkeypatch, mode, use_tiling, temporal_chunk_size):
+    vae = _bare_distributed_vae(monkeypatch, mode=mode, use_tiling=use_tiling)
+    vae.spatial_temporal_chunk_size = temporal_chunk_size
+    z = torch.zeros(1, 2, 6, 2, 2)
+    sample = torch.ones(1, 3, 6, 4, 4)
+    decode = Mock(return_value=SimpleNamespace(sample=sample))
+    monkeypatch.setattr(wan_spatial_shard, "spatial_shard_decode", decode)
+
+    # Exercise the public non-streaming entry point, which dispatches before tiled_decode.
+    assert vae.decode(z).sample is sample
+
+    decode.assert_called_once_with(
+        vae,
+        z,
+        group=None,
+        return_dict=True,
+        split_dim=mode.removeprefix("spatial_shard_"),
+        temporal_chunk_size=temporal_chunk_size,
+    )
+
+
+@pytest.mark.parametrize("use_tiling", [True, False])
 @pytest.mark.parametrize("mode", ["spatial_shard_height", "spatial_shard_width", "tile"])
 def test_distributed_chunked_routing(monkeypatch, mode, use_tiling):
     # use_tiling=False is a fresh serving instance: the registry no longer forces tiling for spatial_shard_*.
