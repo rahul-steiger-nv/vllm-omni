@@ -9,6 +9,7 @@ import weakref
 
 import pytest
 import torch
+from diffusers.models.autoencoders.autoencoder_kl_wan import WanRMS_norm
 from torch import nn
 
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import forwards as fp
@@ -286,3 +287,55 @@ def test_spatial_probe_policy_preserves_exact_paths(monkeypatch, channels_last: 
         assert verdicts == {("shape",): False}
         expected = fp.F.conv3d(fp.F.pad(assembled, (1, 1, 1, 1, 0, 0)), conv.weight, conv.bias)
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("path", ["norm_act", "norm_fallback", "conv_out"])
+@pytest.mark.parametrize("probe_matches", [False, True])
+def test_fused_paths_release_replaced_history_before_probe(
+    cpu_assembly, monkeypatch, path: str, probe_matches: bool
+) -> None:
+    """Old history must not overlap either probe operands or convolution output."""
+    conv = fp.WanCausalConv3d(2, 2, 3, padding=1)
+    conv.weight.fill_(1)
+    conv.bias.zero_()
+    x = torch.ones(1, 2, 2, 3, 4)
+    slots = [torch.ones_like(x)]
+    old_cache = weakref.ref(slots[0])
+    expected = conv(x, slots[0])
+    probes = []
+
+    def probe(*args):
+        assert old_cache() is None, "replaced history must be released before padding/layout probes"
+        probes.append(True)
+        return probe_matches
+
+    monkeypatch.setattr(fp, "_equal_on_random_operands", probe)
+    monkeypatch.setattr(fp, "_SPATIAL_PAD_VERDICTS", weakref.WeakKeyDictionary())
+    monkeypatch.setattr(fp, "_CONV_OUT_LAYOUT_VERDICTS", weakref.WeakKeyDictionary())
+    conv3d = fp.F.conv3d
+
+    def checked_conv(*args, **kwargs):
+        assert old_cache() is None, "replaced history must not overlap the convolution output"
+        return conv3d(*args, **kwargs)
+
+    monkeypatch.setattr(fp.F, "conv3d", checked_conv)
+    if path == "conv_out":
+        output = fp._run_conv_out_channels_last(conv, x, slots, 0)
+    else:
+        norm = WanRMS_norm(2, images=False).eval()
+        setattr(norm, fp.CFG_ATTR, fp.FastPathConfig(fuse_norm_cache=True, channels_last=True))
+
+        def assemble(source, gamma, scale, previous, pad, **kwargs):
+            # The fixture's real copy preserves ownership while standing in for
+            # the CUDA-only normalization/assembly kernel.
+            if path == "norm_fallback":
+                return None
+            return fp.dm.cat_time_5d(source, previous, pad, keep_cache_frames=2)
+
+        monkeypatch.setattr(fp.nc, "norm_act_cat_time", assemble)
+        monkeypatch.setattr(fp, "_norm_act", lambda *args, **kwargs: x)
+        output = fp._run_norm_act_cached_conv(norm, nn.SiLU(), conv, x, slots, 0)
+    assert probes == [True]
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    torch.testing.assert_close(slots[0], x, rtol=0, atol=0)

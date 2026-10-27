@@ -97,7 +97,6 @@ def mock_world_group(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.fixture(autouse=True)
 def mock_dist_vae_executor(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(DistributedVaeExecutor, "gather_tensors", lambda self, x: [x])
     monkeypatch.setattr(DistributedVaeExecutor, "broadcast_tensor", lambda self, x: x)
 
 
@@ -109,6 +108,40 @@ def mock_dist_vae_executor(monkeypatch: pytest.MonkeyPatch):
 def test_uses_dedicated_world_device_group(mock_world_group):
     executor = DistributedVaeExecutor()
     assert executor.group is mock_world_group
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_gather_allocates_receive_buffers_only_on_root(monkeypatch, rank: int):
+    executor = DistributedVaeExecutor()
+    executor.rank = rank
+    tensor = torch.arange(4, dtype=torch.float32)
+    allocations = []
+    empty_like = torch.empty_like
+
+    def allocate(source):
+        allocations.append(source)
+        return empty_like(source)
+
+    def gather(source, *, gather_list, dst, group):
+        assert source is tensor and dst == 0 and group is executor.group
+        if rank == 0:
+            assert len(gather_list) == executor.world_size
+            for peer, result in enumerate(gather_list):
+                result.copy_(source + peer)
+        else:
+            assert gather_list is None
+
+    monkeypatch.setattr(torch, "empty_like", allocate)
+    monkeypatch.setattr(dist, "gather", gather)
+    result = executor.gather_tensors(tensor)
+    if rank == 0:
+        assert len(allocations) == executor.world_size
+        for peer, output in enumerate(result):
+            torch.testing.assert_close(output, tensor + peer)
+            assert output.data_ptr() != tensor.data_ptr()
+    else:
+        assert not allocations
+        assert result is None
 
 
 def test_balance_tasks():

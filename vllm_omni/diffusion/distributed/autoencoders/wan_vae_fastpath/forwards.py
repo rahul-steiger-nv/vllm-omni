@@ -572,11 +572,16 @@ def _run_norm_act_cached_conv(
                 )
                 if pair is not None:
                     assembled, cache_list[index] = pair
+                    del cache, payload
                     fold_bias = return_bias and _may_defer_conv_bias(norm, x)
                     out = _conv_with_spatial_padding(conv, assembled, None if fold_bias else conv.bias, verdicts, key)
                     if not return_bias:
                         return out
                     return out, _deferred_conv_bias(conv, out) if fold_bias else None
+
+        # A declined fused assembly falls through to the ordinary cache path;
+        # do not retain the old history while that helper replaces its slot.
+        del cache, payload
 
     x = _norm_act(norm, act, x, pending_bias=pending_bias)
     if after_norm is not None:
@@ -622,6 +627,7 @@ def _run_conv_out_channels_last(
     if pair is None:
         return None
     assembled, cache_list[index] = pair
+    del cache, payload
 
     def candidate(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return F.conv3d(x, weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups).contiguous()

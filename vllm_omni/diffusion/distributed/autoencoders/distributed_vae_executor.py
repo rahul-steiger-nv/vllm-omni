@@ -88,10 +88,11 @@ class DistributedVaeExecutor:
             raise torch.OutOfMemoryError(f"Distributed VAE {stage} failed: {detail}")
 
     def gather_tensors(self, tensor: torch.Tensor):
+        """Gather tile data only to the merging rank of the complete WORLD group."""
         with self._sync_errors("gather allocation"):
-            gather_list = [torch.empty_like(tensor) for _ in range(self.world_size)]
-        dist.all_gather(gather_list, tensor, group=self.group)
-        return gather_list if self.rank == 0 else None
+            gather_list = [torch.empty_like(tensor) for _ in range(self.world_size)] if self.rank == 0 else None
+        dist.gather(tensor, gather_list=gather_list, dst=0, group=self.group)
+        return gather_list
 
     def broadcast_tensor(self, tensor: torch.Tensor):
         dist.broadcast(tensor, src=0, group=self.group)
