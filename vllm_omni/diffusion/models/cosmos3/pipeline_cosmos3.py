@@ -1467,11 +1467,11 @@ class Cosmos3OmniDiffusersPipeline(
             cfg_reference = cond_full
             # Preserve text CFG on cond_full and add (control_guidance - 1)
             # times the control delta, independent of text guidance.
-            if guidance_scale == 0.0:
-                raise ValueError("Cosmos3 transfer control+text CFG requires a nonzero text guidance scale.")
-            effective_control_guidance = 1.0 + (control_guidance - 1.0) / guidance_scale
-            control_cond = cond_no_control + effective_control_guidance * (cond_full - cond_no_control)
-            combined = uncond_full + guidance_scale * (control_cond - uncond_full)
+            combined = (
+                uncond_full
+                + guidance_scale * (cond_full - uncond_full)
+                + (control_guidance - 1.0) * (cond_full - cond_no_control)
+            )
         else:
             raise ValueError(f"Unknown Cosmos3 transfer CFG branch_mode={mode!r}.")
 
@@ -3333,8 +3333,6 @@ class Cosmos3OmniDiffusersPipeline(
                 timestep = t.unsqueeze(0)
                 step_guidance = guidance_scale if _active_at(t, guidance_interval) else 1.0
                 step_control = control_guidance if _active_at(t, control_guidance_interval) else 1.0
-                if step_guidance == 0.0 and step_control != 1.0:
-                    raise ValueError("Cosmos3 transfer control+text CFG requires a nonzero text guidance scale.")
                 # Guidance <= 1 disables text CFG, as in diffuse(). Callers that
                 # follow a reference which skips it only at exactly 1 opt in.
                 needs_text_cfg = step_guidance != 1.0 if text_cfg_below_one else step_guidance > 1.0

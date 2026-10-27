@@ -2467,7 +2467,7 @@ def test_diffuse_drops_session_when_progress_iteration_fails(make_cosmos3_pipeli
     assert "request-that-fails" not in pipeline._memory_manager
 
 
-@pytest.mark.parametrize("guidance_scale", [1.0, 3.0, 5.0])
+@pytest.mark.parametrize("guidance_scale", [0.0, 1e-40, 0.5, 1.0, 3.0, 5.0])
 @pytest.mark.parametrize("cfg_normalize", [False, True])
 def test_transfer_control_increment_is_independent_of_text_guidance(
     make_cosmos3_pipeline, guidance_scale, cfg_normalize
@@ -2489,41 +2489,45 @@ def test_transfer_control_increment_is_independent_of_text_guidance(
     torch.testing.assert_close(actual, expected)
 
 
-def test_transfer_combined_cfg_rejects_zero_text_guidance(make_cosmos3_pipeline) -> None:
-    pipeline = make_cosmos3_pipeline()
-    predictions = [torch.tensor([6.0]), torch.tensor([2.0]), torch.tensor([1.0])]
-
-    with pytest.raises(ValueError, match="nonzero text guidance scale"):
-        pipeline.combine_multi_branch_cfg_noise(
-            predictions,
-            {"mode": "cosmos3_transfer", "guidance_scale": 0.0, "control_guidance": 1.5},
-        )
-
-
+@pytest.mark.parametrize("guidance_scale", [0.0, 1e-40, 0.5])
 @pytest.mark.parametrize("text_cfg_below_one", [False, True])
-def test_diffuse_transfer_rejects_zero_text_guidance_with_active_control(
-    make_cosmos3_pipeline, text_cfg_below_one
+@pytest.mark.parametrize("delayed_control", [False, True])
+def test_diffuse_transfer_supports_zero_and_small_text_guidance(
+    make_cosmos3_pipeline, sequential_cfg_parallel, guidance_scale, text_cfg_below_one, delayed_control
 ) -> None:
+    """Preserve control-only dispatch and allow combined CFG at zero or tiny scales."""
     pipeline = make_cosmos3_pipeline()
     latents = torch.zeros(1, 2, 1, 1, 1)
-    with pytest.raises(ValueError, match="nonzero text guidance scale"):
-        pipeline.diffuse_transfer(
-            latents=latents,
-            timesteps=torch.tensor([7]),
-            cond_ids=_ids(2),
-            cond_mask=_mask(),
-            uncond_ids=_ids(1),
-            uncond_mask=_mask(),
-            guidance_scale=0.0,
-            control_guidance=1.5,
-            control_guidance_interval=None,
-            control_latents=[torch.zeros_like(latents)],
-            shared_kwargs={},
-            velocity_mask=torch.ones(1, 1, 1, 1, 1),
-            condition_latents=torch.zeros_like(latents),
-            text_cfg_below_one=text_cfg_below_one,
-        )
-    assert pipeline.transformer.calls == []
+    result = pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([9, 7] if delayed_control else [7]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=guidance_scale,
+        control_guidance=1.5,
+        control_guidance_interval=(0.0, 8.0) if delayed_control else None,
+        control_latents=[torch.zeros_like(latents)],
+        shared_kwargs={},
+        velocity_mask=torch.ones(1, 1, 1, 1, 1),
+        condition_latents=torch.zeros_like(latents),
+        text_cfg_below_one=text_cfg_below_one,
+    )
+
+    # The stub predicts 102 with text+control, 2 with text only, and 101
+    # with unconditional text+control; its scheduler adds each prediction.
+    expected_calls = [(2, True), (2, False)]
+    expected = 152.0
+    if text_cfg_below_one:
+        expected_calls.append((1, True))
+        expected = 151.0 + guidance_scale
+    if delayed_control:
+        initial_calls = [(2, True), (1, True)] if text_cfg_below_one else [(2, True)]
+        expected_calls = initial_calls + expected_calls
+        expected += 101.0 + guidance_scale if text_cfg_below_one else 102.0
+    assert [(call["token"], call["has_control"]) for call in pipeline.transformer.calls] == expected_calls
+    torch.testing.assert_close(result, torch.full_like(latents, expected))
 
 
 def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
