@@ -59,7 +59,7 @@ def test_tile_decode_releases_chunks_and_history_on_completion_or_failure(fail_s
     model._cached_conv_counts = {"decoder": 1, "encoder": 0}
     model.post_quant_conv = torch.nn.Identity()
     cache_refs = []
-    chunk_refs = []
+    chunk_refs: list[weakref.ReferenceType[torch.Tensor]] = []
 
     class Decoder(torch.nn.Module):
         temperal_upsample = []
