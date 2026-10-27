@@ -94,9 +94,7 @@ class DistributedVaeExecutor:
         use_all_gather = dist.get_backend(self.group) == "hccl"
         with self._sync_errors("gather allocation"):
             gather_list = (
-                [torch.empty_like(tensor) for _ in range(self.world_size)]
-                if self.rank == 0 or use_all_gather
-                else None
+                [torch.empty_like(tensor) for _ in range(self.world_size)] if self.rank == 0 or use_all_gather else None
             )
         if use_all_gather:
             assert gather_list is not None
