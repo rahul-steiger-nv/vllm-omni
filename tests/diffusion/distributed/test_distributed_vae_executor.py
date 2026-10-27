@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import weakref
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import pytest
@@ -77,6 +78,7 @@ class DummyMixin(DistributedVaeMixin):
 
 @pytest.fixture(autouse=True)
 def mock_dist(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(dist, "get_backend", lambda *args, **kwargs: "nccl")
     monkeypatch.setattr(dist, "get_world_size", lambda *args, **kwargs: 2)
     monkeypatch.setattr(dist, "get_rank", lambda *args, **kwargs: 0)
     monkeypatch.setattr(dist, "is_initialized", lambda: True)
@@ -111,18 +113,32 @@ def test_uses_dedicated_world_device_group(mock_world_group):
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_gather_allocates_receive_buffers_only_on_root(monkeypatch, rank: int):
+@pytest.mark.parametrize("backend", ["nccl", "gloo", "hccl"])
+def test_gather_receive_allocation_policy(monkeypatch, rank: int, backend: str):
     executor = DistributedVaeExecutor()
     executor.rank = rank
+    monkeypatch.setattr(dist, "get_backend", lambda group: backend)
     tensor = torch.arange(4, dtype=torch.float32)
     allocations = []
     empty_like = torch.empty_like
+    guard_active = False
+    sync_errors = executor._sync_errors
+
+    @contextmanager
+    def allocation_guard(stage):
+        nonlocal guard_active
+        with sync_errors(stage):
+            guard_active = True
+            yield
+            guard_active = False
 
     def allocate(source):
+        assert guard_active, "receive allocation must participate in error agreement"
         allocations.append(source)
         return empty_like(source)
 
     def gather(source, *, gather_list, dst, group):
+        assert backend != "hccl" and not guard_active
         assert source is tensor and dst == 0 and group is executor.group
         if rank == 0:
             assert len(gather_list) == executor.world_size
@@ -131,17 +147,44 @@ def test_gather_allocates_receive_buffers_only_on_root(monkeypatch, rank: int):
         else:
             assert gather_list is None
 
+    def all_gather(gather_list, source, *, group):
+        assert backend == "hccl" and not guard_active
+        assert source is tensor and group is executor.group
+        assert len(gather_list) == executor.world_size
+        for peer, result in enumerate(gather_list):
+            result.copy_(source + peer)
+
+    monkeypatch.setattr(executor, "_sync_errors", allocation_guard)
     monkeypatch.setattr(torch, "empty_like", allocate)
     monkeypatch.setattr(dist, "gather", gather)
+    monkeypatch.setattr(dist, "all_gather", all_gather)
     result = executor.gather_tensors(tensor)
+    assert len(allocations) == (executor.world_size if rank == 0 or backend == "hccl" else 0)
     if rank == 0:
-        assert len(allocations) == executor.world_size
         for peer, output in enumerate(result):
             torch.testing.assert_close(output, tensor + peer)
             assert output.data_ptr() != tensor.data_ptr()
     else:
-        assert not allocations
         assert result is None
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_hccl_receive_oom_is_reported_before_collective(monkeypatch, rank: int):
+    executor = DistributedVaeExecutor()
+    executor.rank = rank
+    monkeypatch.setattr(dist, "get_backend", lambda group: "hccl")
+
+    def fail_allocation(source):
+        raise torch.OutOfMemoryError("injected receive allocation failure")
+
+    def unexpected_collective(*args, **kwargs):
+        pytest.fail("data collective must not run after receive allocation failure")
+
+    monkeypatch.setattr(torch, "empty_like", fail_allocation)
+    monkeypatch.setattr(dist, "gather", unexpected_collective)
+    monkeypatch.setattr(dist, "all_gather", unexpected_collective)
+    with pytest.raises(torch.OutOfMemoryError, match="Distributed VAE gather allocation failed"):
+        executor.gather_tensors(torch.zeros(4))
 
 
 def test_balance_tasks():
