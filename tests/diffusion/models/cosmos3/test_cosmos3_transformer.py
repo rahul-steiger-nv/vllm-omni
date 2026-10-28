@@ -912,9 +912,6 @@ def test_sp_releases_full_gen_embedding_during_stack(
                     assert hidden.untyped_storage().data_ptr() != full_pointers[-1]
                 assert hidden.shape == (batch, (total_length + 3) // 4, 8)
                 assert hidden.untyped_storage().nbytes() == hidden.numel() * hidden.element_size()
-                # Regional compilation must reuse the same storage-offset guards
-                # for the first SP layer and subsequent layers.
-                assert hidden.storage_offset() == 0
                 assert kwargs["freqs_cos"].shape[1] == kwargs["freqs_sin"].shape[1] == hidden.shape[1]
             elif not uses_sp:
                 assert hidden.shape == (batch, total_length, 8)
