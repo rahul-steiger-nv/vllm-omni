@@ -267,9 +267,9 @@ def _mixed_quant_config(algorithms):
     )
 
 
-@pytest.mark.parametrize("algorithms", [("FP8",), ("NVFP4",)])
+@pytest.mark.parametrize("algorithms", [("FP8",), ("NVFP4",), ("FP8", "NVFP4")])
 @pytest.mark.parametrize("override", [False, True])
-def test_mixed_modelopt_policy_supports_homogeneous_native_format(algorithms, override) -> None:
+def test_mixed_modelopt_policy_supports_native_formats(algorithms, override) -> None:
     od_config = _checkpoint_od_config(
         _mixed_quant_config(algorithms),
         policy=None if override else _policy(),
@@ -279,17 +279,6 @@ def test_mixed_modelopt_policy_supports_homogeneous_native_format(algorithms, ov
         Cosmos3MixedPrecisionConfig(),
         "additional_config" if override else "checkpoint",
     )
-
-
-@pytest.mark.parametrize("override", [False, True])
-def test_mixed_modelopt_policy_rejects_heterogeneous_formats(override) -> None:
-    od_config = _checkpoint_od_config(
-        _mixed_quant_config(("FP8", "NVFP4")),
-        policy=None if override else _policy(),
-        additional_config={"cosmos3_mixed_precision": {}} if override else None,
-    )
-    with pytest.raises(ValueError, match="does not support mixing FP8 and NVFP4"):
-        resolve_mixed_precision_config(od_config)
 
 
 @pytest.mark.parametrize("algorithm", ["MXFP8", "W4A16_NVFP4", "UNKNOWN"])
@@ -315,8 +304,9 @@ def test_mixed_modelopt_policy_rejects_malformed_layer(entry) -> None:
         ("NVFP4", "nvfp4_config", "is_checkpoint_nvfp4_serialized"),
     ],
 )
-def test_mixed_modelopt_policy_validates_selected_subconfig(algorithm, subconfig, flag) -> None:
-    config = _mixed_quant_config((algorithm,))
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_mixed_modelopt_policy_validates_selected_subconfig(algorithm, subconfig, flag, hybrid) -> None:
+    config = _mixed_quant_config(("FP8", "NVFP4") if hybrid else (algorithm,))
     setattr(getattr(config, subconfig), flag, False)
     with pytest.raises(ValueError, match="serialized ModelOpt"):
         read_checkpoint_policy(_checkpoint_od_config(config, policy=_policy()))

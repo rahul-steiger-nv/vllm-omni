@@ -1784,3 +1784,38 @@ def test_shared_gen_stack_preserves_control_metadata_sharding_and_wrapped_output
     output = model._run_gen_layers(inputs, gather_output=False, **kwargs)
     torch.testing.assert_close(output, torch.full_like(inputs, 4 if already_sharded else 5))
     assert len(gathered) == 1
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("presharded", [False, True])
+def test_gen_stack_uses_consistent_storage_offsets_after_sp(rank, presharded) -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    offsets = []
+
+    class Shard(nn.Module):
+        def forward(self, hidden, cos, sin):
+            return hidden.chunk(2, dim=1)[rank], cos, sin
+
+    class Layer(nn.Module):
+        def forward(self, hidden, **kwargs):
+            offsets.append(hidden.storage_offset())
+            return hidden + 1
+
+    model = object.__new__(Cosmos3VFMTransformer)
+    nn.Module.__init__(model)
+    model.gen_sp_prepare = Shard()
+    model.gen_sp_gather = nn.Identity()
+    model.gen_layers = nn.ModuleList([Layer(), Layer()])
+    model.cached_kv = [(torch.zeros(1), torch.zeros(1))] * 2
+    model.cached_freqs_gen = (torch.zeros(1), torch.zeros(1))
+    hidden = torch.arange(32, dtype=torch.float32).reshape(1, 4, 8)
+    original = hidden.clone()
+    if presharded:
+        sharded, freqs = model._shard_gen_inputs(hidden)
+        output = model._run_gen_layers(sharded, freqs_gen=freqs)
+    else:
+        output = model._run_gen_layers(hidden)
+    assert offsets == [0, 0]
+    torch.testing.assert_close(output, original.chunk(2, dim=1)[rank] + 2)
+    torch.testing.assert_close(hidden, original)

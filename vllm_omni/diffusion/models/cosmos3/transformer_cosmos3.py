@@ -2000,6 +2000,9 @@ class Cosmos3VFMTransformer(nn.Module):
         if self.cached_freqs_gen is None:
             raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
         hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, *self.cached_freqs_gen)
+        # Match later layers' zero-offset inputs to reuse compiled graphs.
+        if hidden_gen.storage_offset():
+            hidden_gen = hidden_gen.clone()
         return hidden_gen, (freqs_cos, freqs_sin)
 
     def forward(
