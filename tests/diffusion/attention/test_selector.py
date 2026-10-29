@@ -241,6 +241,46 @@ def test_sparse_resolution_uses_platform_and_preserves_method(monkeypatch, spars
             selector.get_attn_backend_for_role("self", 192, config)
 
 
+@pytest.mark.parametrize(("capability_query", "allow_trtllm_default"), [(False, False), (False, True), (True, None)])
+def test_sparse_exact_role_resolution_with_production_keywords(
+    monkeypatch, sparse_platform, capability_query, allow_trtllm_default
+):
+    """The production keyword call preserves an exact sparse role over dense defaults."""
+    from vllm_omni.diffusion.attention.block_sparse import BlockSparseBackend
+
+    _, backend, _, calls = sparse_platform
+    monkeypatch.setattr(selector, "_load_backend_cls", lambda path: backend)
+    config = AttentionConfig(
+        default=AttentionSpec(backend="TORCH_SDPA"),
+        per_role={
+            "self": AttentionSpec(backend="TORCH_SDPA"),
+            "cosmos3.gen": {
+                "name": "block_sparse",
+                "config": {"backend": {"require": "FLASH_ATTN", "implementation": "future-provider-id"}},
+            },
+        },
+    )
+
+    if capability_query:
+        result = selector.get_attn_backend_for_capability(
+            role="cosmos3.gen",
+            attention_config=config,
+            role_category="self",
+        )
+        assert result is BlockSparseBackend
+    else:
+        result, spec = selector.get_attn_backend_for_role(
+            role="cosmos3.gen",
+            head_size=128,
+            attention_config=config,
+            role_category="self",
+            allow_trtllm_default=allow_trtllm_default,
+        )
+        assert result is backend
+        assert spec is config.per_role["cosmos3.gen"]
+    assert calls == [("future-provider-id", selector.HEAD_SIZE_UNKNOWN if capability_query else 128)]
+
+
 @pytest.mark.parametrize("platform_name", ["ROCM", "NPU", "XPU", "MUSA", "UNSPECIFIED"])
 def test_sparse_platform_rejects_before_loading_provider(monkeypatch, sparse_platform, platform_name):
     from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum

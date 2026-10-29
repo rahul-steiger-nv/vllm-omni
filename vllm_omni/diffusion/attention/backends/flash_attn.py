@@ -141,16 +141,22 @@ class FA4SparseAdapter(BlockSparseAdapter):
             full_block_idx=indices,
             block_size=block_size,
         )
-        result = flash_attn_func(
-            query,
-            key,
-            value,
-            softmax_scale=scale,
-            causal=False,
-            num_splits=1,
-            pack_gqa=False,
-            block_sparse_tensors=sparse,
-        )
+        try:
+            result = flash_attn_func(
+                query,
+                key,
+                value,
+                softmax_scale=scale,
+                causal=False,
+                num_splits=1,
+                pack_gqa=False,
+                block_sparse_tensors=sparse,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"FA4 sparse attention rejected the request with block_size={list(block_size)}. "
+                f"Check the attention configuration. FA4 reported: {exc}"
+            ) from exc
         return (result[0] if isinstance(result, tuple) else result).contiguous()
 
     @staticmethod
@@ -168,6 +174,8 @@ class FA4SparseAdapter(BlockSparseAdapter):
         block_size: tuple[int, int],
     ) -> None:
         self.validate_selection(implementation, head_size)
+        # FA4 tile compatibility is intentionally deferred to execute() with
+        # actual Q/K/V; see docs/design/feature/fa4_subblock_poc.md.
         _, _, self.dependency_version = self._load_api()
 
     def execute(

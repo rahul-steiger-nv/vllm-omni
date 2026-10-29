@@ -111,6 +111,15 @@ The selector and installed kernel must both accept the requested geometry;
 provider support is checked against the installed implementation rather than a
 copied hardware/dtype/head-size allowlist.
 
+`FA4SparseAdapter.prepare()` loads the dependency but intentionally defers tile
+compatibility to `execute()` with actual Q/K/V. An incompatible block size
+therefore raises during the first request preparation, before support is recorded.
+The shipped 64×64 recipes target Hopper; use explicit 256×128 blocks for the
+validated Blackwell path. Construction alone does not establish tile support.
+FA4 execution `ValueError`s include the requested block size and ask the user to
+check the attention configuration. The original error message and cause are
+preserved; other exception types propagate unchanged.
+
 Sparse provider selection follows the [platform selection contract](attention_backend_selection.md#registry-and-platform-boundary).
 
 `BlockSparseAttention` owns routing, validation, and request preparation.
