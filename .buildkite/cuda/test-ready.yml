@@ -58,13 +58,14 @@ steps:
           - tests/helpers/
           - tests/diffusion/attention/
           - vllm_omni/diffusion/
+          - vllm_omni/platforms/
         commands:
           - "python -c \"from importlib.metadata import version; print(chr(10).join(f'{p}=={version(p)}' for p in ('torch', 'triton', 'vllm')))\" > /tmp/sparse-ci-constraints.txt"
           - "uv pip install --system --constraint /tmp/sparse-ci-constraints.txt -e '.[fa4]'"
           - "python -c \"from flash_attn.cute.interface import flash_attn_func; assert callable(flash_attn_func)\""
           - "python -c \"import torch; assert torch.cuda.get_device_capability() == (9, 0)\""
           - "python .buildkite/cuda/scripts/check_vllm_runtime.py"
-          - "timeout 30m pytest -sv tests/diffusion/attention/test_block_sparse.py tests/diffusion/attention/test_block_sparse_adapters.py -m 'core_model and cuda and H100 and cards_1' --run-level=core_model"
+          - "timeout 30m pytest -sv tests/diffusion/attention/test_block_sparse.py tests/diffusion/attention/test_block_sparse_adapters.py tests/diffusion/attention/test_flash_attn_compile.py -m 'core_model and cuda and H100 and cards_1' --run-level=core_model"
         mirror_hardwares: h100_1
 
       - label: "Diffusion · Sparse FA4 · Blackwell"
@@ -79,6 +80,7 @@ steps:
           - tests/helpers/
           - tests/diffusion/attention/
           - vllm_omni/diffusion/
+          - vllm_omni/platforms/
         commands:
           - "python -c \"from importlib.metadata import version; print(chr(10).join(f'{p}=={version(p)}' for p in ('torch', 'triton', 'vllm')))\" > /tmp/sparse-ci-constraints.txt"
           - "uv pip install --system --constraint /tmp/sparse-ci-constraints.txt -e '.[fa4]'"
@@ -100,6 +102,7 @@ steps:
           - tests/helpers/
           - tests/diffusion/attention/
           - vllm_omni/diffusion/
+          - vllm_omni/platforms/
           - tests/diffusion/models/cosmos3/
           - tests/diffusion/models/minimax_h3/
         commands:
@@ -123,6 +126,7 @@ steps:
           - tests/helpers/
           - tests/diffusion/attention/
           - vllm_omni/diffusion/
+          - vllm_omni/platforms/
           - tests/diffusion/models/cosmos3/
           - tests/diffusion/models/minimax_h3/
         commands:
