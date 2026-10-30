@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from types import MethodType
 from typing import Any
@@ -236,7 +236,12 @@ def _install_bindings(
         clone_encoder_shortcuts=clone_encoder_shortcuts,
         fuse_norm_cache=encoder,
         exact_bf16_norm=encoder,
+        verify_spatial_padding=encoder or level != "channels_last",
     )
+    # Preserve the output projection's validated formulation. Internal decoder
+    # convolutions can use implicit padding under the channels-last tolerance
+    # contract without allocating full-size first-use equivalence probes.
+    output_cfg = replace(cfg, verify_spatial_padding=True)
 
     with ExitStack() as rollback:
         undo: list[Callable[[], None]] = []
@@ -257,7 +262,8 @@ def _install_bindings(
             undo.append(restore)
             if forward is not None:
                 module.forward = MethodType(forward, module)
-            setattr(module, forwards.CFG_ATTR, cfg)
+            module_cfg = output_cfg if module is getattr(component, "conv_out", None) else cfg
+            setattr(module, forwards.CFG_ATTR, module_cfg)
             patched[type(module).__name__] = patched.get(type(module).__name__, 0) + 1
 
         for module, replacement in bindings:
