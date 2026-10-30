@@ -1564,7 +1564,7 @@ def test_ring_packed_attention_publishes_prefix_length_without_global_mask():
 
 @pytest.mark.cpu
 def test_ring_packed_attention_keeps_mask_when_runtime_sp_is_inactive(monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks
 
     class InactiveContext:
         sp_active = False
@@ -1572,13 +1572,13 @@ def test_ring_packed_attention_keeps_mask_when_runtime_sp_is_inactive(monkeypatc
     attention = _fake_packed_attention("CUDNN_ATTN")
     attention.attention.use_ring = True
     monkeypatch.setattr(
-        minimax_h3_transformer,
+        minimax_h3_blocks,
         "is_forward_context_available",
         lambda: True,
         raising=False,
     )
     monkeypatch.setattr(
-        minimax_h3_transformer,
+        minimax_h3_blocks,
         "get_forward_context",
         InactiveContext,
         raising=False,
@@ -4024,7 +4024,7 @@ def test_unpadded_sage_token_refiner_preserves_legacy_dispatch(monkeypatch):
     from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
     from vllm_omni.diffusion.config import set_current_diffusion_config
     from vllm_omni.diffusion.data import AttentionConfig
-    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as transformer
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as transformer
 
     config = AttentionConfig(
         default={"backend": "TORCH_SDPA"},
@@ -4104,6 +4104,7 @@ def test_minimax_sparse_recipe_constructs_model_and_dispatches(monkeypatch):
     from vllm_omni.diffusion.config import set_current_diffusion_config
     from vllm_omni.diffusion.data import AttentionConfig
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as transformer
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import _attention_isolates_packed_requests
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("Requires Hopper SM90 and FA4")
@@ -4157,7 +4158,7 @@ def test_minimax_sparse_recipe_constructs_model_and_dispatches(monkeypatch):
     assert dit.attention.attn_backend is BlockSparseBackend
     assert not isinstance(refiner.attention.attention, BlockSparseAttention)
     assert refiner.attention.attn_backend.get_name() == "FLASH_ATTN"
-    assert not transformer._attention_isolates_packed_requests(dit.attention)
+    assert not _attention_isolates_packed_requests(dit.attention)
     calls = []
     real_length = 1089
 
