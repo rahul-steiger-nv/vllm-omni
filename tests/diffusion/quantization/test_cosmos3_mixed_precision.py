@@ -784,6 +784,48 @@ def test_reset_clears_generation_state() -> None:
     assert not runtime.use_high_precision("generation")
 
 
+def test_install_hybrid_uses_real_modelopt_strategies(monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    from vllm.config.quantization import QuantSpec
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm.model_executor.layers.quantization.modelopt import CkptCtx, ModelOptLinearMethod
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8StaticTensorSym,
+        kNvfp4Dynamic,
+        kNvfp4Static,
+    )
+
+    # Real methods/specs and registry, without hardware-dependent kernel
+    # initialization. The CPU FP8 kernels require AMX, unavailable on ARM64;
+    # this portable CPU test covers installation, not native execution.
+    specs = (
+        QuantSpec(weight=kFp8StaticTensorSym, activation=kFp8StaticTensorSym),
+        QuantSpec(weight=kNvfp4Static, activation=kNvfp4Dynamic),
+    )
+    methods = [ModelOptLinearMethod(spec, CkptCtx()) for spec in specs]
+    linears = [LinearBase(16, 16, prefix=f"gen_layers.{index}", disable_tp=True) for index in range(2)]
+    for layer, method in zip(linears, methods):
+        layer.quant_method = method
+    transformer = torch.nn.Module()
+    transformer.gen_layers = torch.nn.ModuleList(linears)
+    runtime = Cosmos3MixedPrecisionRuntime(Cosmos3MixedPrecisionConfig(reasoner="native"))
+    log_info = Mock()
+    monkeypatch.setattr(runtime_impl.logger, "info", log_info)
+
+    runtime.install(transformer)
+
+    for layer, base_method, strategy_type in zip(linears, methods, (Fp8W8A8W8A16Strategy, Nvfp4W4A4W4A16Strategy)):
+        wrapper = layer.quant_method
+        assert isinstance(wrapper, Cosmos3MixedPrecisionLinearMethod)
+        assert wrapper.base_method is base_method
+        assert isinstance(wrapper.strategy, strategy_type)
+        assert wrapper.strategy in runtime_impl._STRATEGIES
+        assert wrapper.runtime is runtime
+        assert wrapper.path == "generation"
+    log_info.assert_called_once_with("Cosmos3 mixed precision wrapped linears: fp8=%d, nvfp4=%d", 1, 1)
+
+
 def test_install_discovers_generation_and_opt_in_reasoner(monkeypatch) -> None:
     class _FakeLinear(torch.nn.Module):
         def __init__(self, prefix: str) -> None:

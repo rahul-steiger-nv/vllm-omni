@@ -298,12 +298,22 @@ its live weight layout cannot support A16 dequantization.
 The runtime selects FP8 or NVFP4 from the checkpoint's ModelOpt configuration.
 BF16 linears are untouched. A `modelopt_mixed` checkpoint can contain FP8,
 NVFP4, or both, provided each selected format has serialized weights and scales.
-For example, a hybrid checkpoint can store the final six transformer layers in
-FP8 and the remaining layers in NVFP4. This layer assignment is independent of
-the diffusion-step schedule: A16 steps retain the checkpoint's stored weights.
+Hybrid support is experimental policy compatibility pending publication of a
+validated checkpoint recipe. No public hybrid checkpoint or end-to-end
+Blackwell validation is provided here. Layer assignment is independent of the
+diffusion-step schedule: A16 steps retain the checkpoint's stored weights.
 The `reasoner` setting is also independent: `"native"` preserves its checkpoint
 precision (for example, FP8 W8A8 or BF16 W16A16), while `"a16"` uses 16-bit
 activations for its quantized linears.
+
+`linear_backend` applies to every quantized linear. With
+`--linear-backend emulation`, vLLM versions without an FP8 emulation kernel
+warn and fall back to normal FP8 kernel selection; that warning alone does not
+mean the hybrid load failed.
+
+For `modelopt_mixed`, keep modules that load in BF16 serialized in BF16: the
+mixed-checkpoint adapter does not support dequantizing packed NVFP4 weights
+for those modules. Support for `modelopt_fp4` does not remove this limitation.
 
 ## Validation and Notes
 
